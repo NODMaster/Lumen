@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 if sys.platform == "win32":
     import ctypes
@@ -396,8 +397,96 @@ def _delete_startup_approved(app_name: str) -> None:
         pass
 
 
+def _split_startup_command(command: str) -> tuple[str, str]:
+    """Split a ``list2cmdline`` command into executable and arguments."""
+    text = str(command or "").strip()
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        if end > 0:
+            return text[1:end], text[end + 1 :].strip()
+    executable, _, arguments = text.partition(" ")
+    return executable, arguments.strip()
+
+
+def build_startup_task_xml(command: str, user: str) -> str:
+    """Task Scheduler definition for the elevated logon autostart.
+
+    ``schtasks /SC ONLOGON`` keeps Task Scheduler defaults that do not suit a
+    tray app: it refuses to start on battery, is stopped when the laptop
+    unplugs, is killed after 72 hours and runs at below-normal priority (which
+    the network cores inherit).  The XML definition removes those limits, binds
+    the trigger to the current user and starts in the program folder.
+    """
+    from xml.sax.saxutils import escape
+
+    executable, arguments = _split_startup_command(command)
+    working_dir = str(Path(executable).parent) if executable else ""
+    user_xml = escape(user)
+    arguments_xml = f"<Arguments>{escape(arguments)}</Arguments>" if arguments else ""
+    working_xml = f"<WorkingDirectory>{escape(working_dir)}</WorkingDirectory>" if working_dir else ""
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        "  <RegistrationInfo><Description>Lumen autostart</Description></RegistrationInfo>\n"
+        "  <Triggers>\n"
+        f"    <LogonTrigger><Enabled>true</Enabled><UserId>{user_xml}</UserId></LogonTrigger>\n"
+        "  </Triggers>\n"
+        "  <Principals>\n"
+        f'    <Principal id="Author"><UserId>{user_xml}</UserId><LogonType>InteractiveToken</LogonType>'
+        "<RunLevel>HighestAvailable</RunLevel></Principal>\n"
+        "  </Principals>\n"
+        "  <Settings>\n"
+        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
+        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
+        "    <AllowHardTerminate>true</AllowHardTerminate>\n"
+        "    <StartWhenAvailable>false</StartWhenAvailable>\n"
+        "    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n"
+        "    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>\n"
+        "    <AllowStartOnDemand>true</AllowStartOnDemand>\n"
+        "    <Enabled>true</Enabled>\n"
+        "    <Hidden>false</Hidden>\n"
+        "    <RunOnlyIfIdle>false</RunOnlyIfIdle>\n"
+        "    <WakeToRun>false</WakeToRun>\n"
+        "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n"
+        "    <Priority>5</Priority>\n"
+        "  </Settings>\n"
+        '  <Actions Context="Author">\n'
+        f"    <Exec><Command>{escape(executable)}</Command>{arguments_xml}{working_xml}</Exec>\n"
+        "  </Actions>\n"
+        "</Task>\n"
+    )
+
+
 def _create_startup_task(command: str) -> None:
     _delete_startup_task()
+    result = None
+    fd, xml_path = tempfile.mkstemp(prefix="lumen-task-", suffix=".xml")
+    os.close(fd)
+    try:
+        Path(xml_path).write_text(build_startup_task_xml(command, _current_task_user()), encoding="utf-16")
+        result = subprocess.run(
+            ["schtasks", "/Create", "/TN", TASK_NAME, "/XML", xml_path, "/F"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=SCHTASKS_TIMEOUT,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        result = None
+    finally:
+        try:
+            os.unlink(xml_path)
+        except OSError:
+            pass
+    if result is not None and getattr(result, "returncode", 1) == 0:
+        return
+    _create_startup_task_legacy(command)
+
+
+def _create_startup_task_legacy(command: str) -> None:
     subprocess.run(
         [
             "schtasks",

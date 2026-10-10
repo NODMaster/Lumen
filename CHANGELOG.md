@@ -8,8 +8,8 @@
 - feat: clean up domain and IP rules as they are typed — URLs, ports, paths, `www.` and IDN are reduced to the bare host, IP or CIDR, and several addresses can be added at once with a preview
 - feat: translate the whole interface, notifications, event log and backend messages into English, Persian and Chinese
 - fix: make the "Start Zapret with Lumen" switch work
-- fix: keep an already running Lumen in the tray when Windows autostart launches a second instance
+- fix: make autostart in the tray reliable on Windows 11 — the elevated logon task no longer refuses to start on battery, is not stopped after 3 days and runs at normal priority, the tray icon appears even when Lumen starts before the taskbar, and an already running Lumen stays in the tray when autostart launches a second copy
 - fix: open drop-down lists upwards when there is no room below and give them a working scrollbar
-- test: cover the welcome flow, WARP profiles, proxy chains, per-server Zapret, rule clean-up and translations
+- test: cover the welcome flow, WARP profiles, proxy chains, per-server Zapret, rule clean-up, translations and the autostart task
 
 Full Changelog: https://github.com/krambovic/Lumen/compare/v1.9.18...v2.0.0

@@ -1,6 +1,8 @@
 """System tray icon for the QML frontend."""
 from __future__ import annotations
 
+import sys
+
 from PyQt6.QtGui import QAction, QCursor, QIcon
 from PyQt6.QtWidgets import QMenu, QSystemTrayIcon
 from PyQt6.QtCore import QObject, QPoint, QRect, Qt, QTimer
@@ -8,6 +10,33 @@ from PyQt6.QtCore import QObject, QPoint, QRect, Qt, QTimer
 from ..constants import APP_ICON_PATH, APP_NAME
 from ..i18n import tr
 from .toast import show_toast
+
+
+def _taskbar_present() -> bool:
+    """Whether Explorer's taskbar exists and can host notification icons."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.user32.FindWindowW("Shell_TrayWnd", None))
+    except Exception:
+        return True
+
+
+def _allow_taskbar_created_message() -> None:
+    """Let Explorer's TaskbarCreated broadcast reach an elevated Lumen."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        message = user32.RegisterWindowMessageW("TaskbarCreated")
+        if message:
+            user32.ChangeWindowMessageFilter(message, 1)  # MSGFLT_ADD
+    except Exception:
+        pass
 
 
 class QmlTray(QObject):
@@ -93,7 +122,39 @@ class QmlTray(QObject):
             pass
 
         self._refresh_actions()
+        _allow_taskbar_created_message()
         self._tray.show()
+        # A logon autostart can run before Explorer has created the taskbar;
+        # the icon added then is lost, leaving Lumen running invisibly.  Wait
+        # for the taskbar and add the icon again once it is ready.
+        self._taskbar_wait_ticks = 0
+        self._taskbar_timer: QTimer | None = None
+        if not _taskbar_present():
+            self._taskbar_timer = QTimer(self)
+            self._taskbar_timer.setInterval(1000)
+            self._taskbar_timer.timeout.connect(self._wait_for_taskbar)
+            self._taskbar_timer.start()
+
+    def _wait_for_taskbar(self) -> None:
+        timer = self._taskbar_timer
+        if timer is None:
+            return
+        self._taskbar_wait_ticks += 1
+        if _taskbar_present():
+            timer.stop()
+            # Explorer accepts notification icons shortly after the taskbar
+            # window appears; re-adding twice covers slow shell start-ups.
+            QTimer.singleShot(1500, self._reinstall_tray_icon)
+            QTimer.singleShot(6000, self._reinstall_tray_icon)
+        elif self._taskbar_wait_ticks >= 300:
+            timer.stop()
+
+    def _reinstall_tray_icon(self) -> None:
+        try:
+            self._tray.hide()
+            self._tray.show()
+        except Exception:
+            pass
 
     def _window_visible(self) -> bool:
         try:
