@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
+from typing import Callable
 
 from PyQt6.QtCore import QAbstractListModel, QModelIndex, QSortFilterProxyModel, Qt, pyqtProperty, pyqtSignal, pyqtSlot
 
@@ -29,10 +31,41 @@ class LogModel(QAbstractListModel):
         SearchRole: b"searchText",
     }
 
-    def __init__(self, max_lines: int = 4000, parent=None) -> None:
+    def __init__(
+        self,
+        max_lines: int = 4000,
+        parent=None,
+        translator: Callable[[str], str] | None = None,
+    ) -> None:
         super().__init__(parent)
         self._max_lines = int(max_lines)
         self._lines: deque[LogEntry] = deque(maxlen=self._max_lines)
+        self._translator = translator
+
+    def _localized_entry(self, entry: LogEntry) -> LogEntry:
+        """Translate text produced by log humanization (it is always Russian).
+
+        Raw log lines are localized before they reach the model; only the
+        friendly summaries added by ``parse_log_line`` still need translation.
+        """
+        translate = self._translator
+        if translate is None:
+            return entry
+        changes: dict[str, str] = {}
+        if entry.message != entry.details:
+            changes["message"] = translate(entry.message)
+            changes["details"] = translate(entry.details)
+        if entry.source and not entry.source.isascii():
+            changes["source"] = translate(entry.source)
+        if entry.action_label:
+            changes["action_label"] = translate(entry.action_label)
+        if not changes:
+            return entry
+        source = changes.get("source", entry.source)
+        message = changes.get("message", entry.message)
+        details = changes.get("details", entry.details)
+        changes["search_text"] = f"{source} {message} {details}".lower()
+        return replace(entry, **changes)
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
@@ -75,7 +108,7 @@ class LogModel(QAbstractListModel):
 
     def append_lines(self, lines) -> None:
         """Append a burst with at most one remove and one insert notification."""
-        entries = [parse_log_line(str(line)) for line in lines if str(line).strip()]
+        entries = [self._localized_entry(parse_log_line(str(line))) for line in lines if str(line).strip()]
         if not entries:
             return
         if len(entries) >= self._max_lines:

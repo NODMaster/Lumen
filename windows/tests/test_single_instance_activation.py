@@ -71,3 +71,26 @@ def test_unavailable_primary_displays_actionable_message(monkeypatch) -> None:
 
     assert len(calls) == 1
     assert "Диспетчер задач" in calls[0][1]
+
+
+def test_should_start_in_tray_conditions() -> None:
+    assert main_qml._should_start_in_tray(["Lumen.exe", "--tray"]) is True
+    assert main_qml._should_start_in_tray(["--tray"]) is True
+    assert main_qml._should_start_in_tray(["Lumen.exe"]) is False
+    assert main_qml._should_start_in_tray([]) is False
+    assert main_qml._should_start_in_tray(["Lumen.exe", "--tray", "--relaunched"]) is False
+    assert main_qml._should_start_in_tray(["Lumen.exe", "--tray", "--relaunch-as-admin"]) is False
+    assert main_qml._should_start_in_tray(["Lumen.exe", "--tray"], initial_deep_link="lumen://add") is False
+
+
+def test_notify_primary_instance_skips_foreground_for_tray(monkeypatch) -> None:
+    calls: list[object] = []
+    user32 = SimpleNamespace(AllowSetForegroundWindow=lambda *args: calls.append(args))
+    monkeypatch.setattr(main_qml.sys, "platform", "win32")
+    monkeypatch.setattr(main_qml.ctypes, "windll", SimpleNamespace(user32=user32))
+
+    main_qml._notify_primary_instance("nonexistent_server", ["Lumen.exe", "--tray"])
+    assert len(calls) == 0
+
+    main_qml._notify_primary_instance("nonexistent_server", ["Lumen.exe"])
+    assert len(calls) == 1

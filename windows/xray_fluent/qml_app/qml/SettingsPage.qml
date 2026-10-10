@@ -920,6 +920,106 @@ Item {
             }
         }
         Card {
+            id: proxyChainCard
+            Layout.fillWidth: true
+            property var options: []
+            property var preview: ({ "hops": [], "notes": [] })
+            function indexOf(value) {
+                for (var i = 0; i < options.length; i++)
+                    if (options[i].value === value)
+                        return i
+                return 0
+            }
+            function reload() {
+                options = App.proxyChainNodeOptions()
+                preview = App.proxyChainPreview()
+            }
+            Component.onCompleted: reload()
+            onVisibleChanged: if (visible) reload()
+            Connections {
+                target: App
+                function onSettingsChanged() { proxyChainCard.reload() }
+            }
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 14
+                Text { text: I18n.t("Цепочка прокси"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontStrong; font.weight: Font.DemiBold }
+
+                SettingRow {
+                    glyph: "\uE71B"; title: I18n.t("Использовать цепочку")
+                    subtitle: I18n.t("Приложение → предыдущий прокси → выбранный сервер → выходной прокси → сайт. Работает в Xray и sing-box.")
+                    Switch { checked: App.proxyChainEnabled; onToggled: App.setProxyChainEnabled(checked) }
+                }
+                SettingRow {
+                    enabled: App.proxyChainEnabled
+                    opacity: enabled ? 1 : 0.5
+                    glyph: "\uE8AB"; title: I18n.t("Предыдущий прокси")
+                    subtitle: I18n.t("Через него идёт подключение к выбранному серверу")
+                    SearchCombo {
+                        Layout.preferredWidth: 260
+                        model: proxyChainCard.options
+                        currentIndex: proxyChainCard.indexOf(App.proxyChainFrontId)
+                        onActivated: (index) => App.setProxyChainFront(proxyChainCard.options[index].value)
+                    }
+                }
+                SettingRow {
+                    enabled: App.proxyChainEnabled
+                    opacity: enabled ? 1 : 0.5
+                    glyph: "\uE774"; title: I18n.t("Выходной прокси")
+                    subtitle: I18n.t("Сайты видят IP этого сервера")
+                    SearchCombo {
+                        Layout.preferredWidth: 260
+                        model: proxyChainCard.options
+                        currentIndex: proxyChainCard.indexOf(App.proxyChainExitId)
+                        onActivated: (index) => App.setProxyChainExit(proxyChainCard.options[index].value)
+                    }
+                }
+                Flow {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 34
+                    visible: App.proxyChainEnabled && proxyChainCard.preview.hops.length > 1
+                    spacing: 6
+                    Repeater {
+                        model: proxyChainCard.preview.hops
+                        delegate: Row {
+                            spacing: 6
+                            Text {
+                                visible: index > 0
+                                text: "\uE76C"; font.family: "Segoe Fluent Icons"; font.pixelSize: 10
+                                color: Theme.textFaint
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                            Rectangle {
+                                radius: 10; height: 22
+                                width: Math.min(220, hopText.implicitWidth + 18)
+                                color: modelData.role === "main" ? Theme.accentSoft : Theme.controlFill
+                                border.width: 1; border.color: Theme.borderSolid
+                                Text {
+                                    id: hopText
+                                    anchors.centerIn: parent
+                                    width: parent.width - 14
+                                    horizontalAlignment: Text.AlignHCenter
+                                    elide: Text.ElideRight
+                                    text: modelData.label
+                                    color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSmall
+                                }
+                            }
+                        }
+                    }
+                }
+                Repeater {
+                    model: App.proxyChainEnabled ? proxyChainCard.preview.notes : []
+                    delegate: Text {
+                        Layout.fillWidth: true
+                        Layout.leftMargin: 34
+                        text: "\u26A0 " + modelData
+                        color: Theme.warning; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSmall
+                        wrapMode: Text.WordWrap
+                    }
+                }
+            }
+        }
+        Card {
             Layout.fillWidth: true
             visible: page.showAdvancedSettings
             ColumnLayout {

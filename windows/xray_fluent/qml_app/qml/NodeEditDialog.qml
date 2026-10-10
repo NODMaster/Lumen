@@ -176,7 +176,7 @@ Popup {
     component DynamicTextField: FField {
         property var fieldSpec: ({})
         text: String(dlg.fieldValue(fieldSpec.key, ""))
-        placeholderText: fieldSpec.placeholder || ""
+        placeholderText: I18n.t(fieldSpec.placeholder || "")
         // Редактор серверов всегда показывает исходное значение целиком:
         // пользователь должен видеть и иметь возможность исправить любой параметр.
         echoMode: TextInput.Normal

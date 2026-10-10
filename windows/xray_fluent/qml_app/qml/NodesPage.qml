@@ -179,7 +179,7 @@ Item {
         for (var i = 0; i < banners.length; ++i) {
             var banner = banners[i] || {};
             providerBanners.append({
-                text: String(banner.text || banner.title || ""),
+                text: I18n.t(String(banner.text || banner.title || "")),
                 visible: banner.visible !== false
             });
         }
@@ -379,16 +379,17 @@ Item {
         var r = rowAtSelectionPoint(selectionPointerX, selectionPointerY);
         if (r >= 0) selectRange(anchorRow, r);
     }
-    function scrollDragSelection() {
+    function scrollDragSelection(frameScale) {
         if (!selectionDragging || !listVbarTrack.scrollable) return;
+        var k = frameScale > 0 ? Math.min(frameScale, 4) : 1;
         var edge = Math.max(28, rowH);
         var delta = 0;
         if (selectionPointerY < edge) {
-            delta = -Math.ceil(((edge - selectionPointerY) / edge) * rowH);
+            delta = -((edge - selectionPointerY) / edge) * rowH * k;
         } else if (selectionPointerY > list.height - edge) {
-            delta = Math.ceil(((selectionPointerY - (list.height - edge)) / edge) * rowH);
+            delta = ((selectionPointerY - (list.height - edge)) / edge) * rowH * k;
         }
-        if (delta === 0) return;
+        if (Math.abs(delta) < 0.01) return;
         listScrollAnim.stop();
         list.contentY = Math.max(listVbarTrack.minY, Math.min(listVbarTrack.maxY, list.contentY + delta));
         listVbarTrack.flash();
@@ -1403,12 +1404,12 @@ Item {
                             onCanceled: page.stopSelectionDrag()
                         }
 
-                        Timer {
+                        // Ticks once per rendered frame (the monitor's refresh
+                        // rate); the step is scaled to keep the old 30 ms speed.
+                        FrameAnimation {
                             id: selectionDragScroll
-                            interval: 30
-                            repeat: true
                             running: page.selectionDragging
-                            onTriggered: page.scrollDragSelection()
+                            onTriggered: page.scrollDragSelection(frameTime / 0.03)
                         }
                     }
 

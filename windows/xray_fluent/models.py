@@ -420,6 +420,12 @@ class AppSettings:
     window_y: int = -1
     zapret_preset: str = ""
     zapret_autostart: bool = False
+    # node_id -> zapret preset name started together with that server ("" = current preset)
+    zapret_server_presets: dict[str, str] = field(default_factory=dict)
+    # v2rayN-style proxy chain: front proxy -> selected server -> exit proxy
+    proxy_chain_enabled: bool = False
+    proxy_chain_front_node_id: str = ""
+    proxy_chain_exit_node_id: str = ""
     auto_switch_enabled: bool = False
     auto_switch_threshold_kbps: int = 50
     auto_switch_delay_sec: int = 30
@@ -478,6 +484,8 @@ class AppSettings:
     selected_subscription_id: str = ""
     node_table_layout: dict[str, Any] = field(default_factory=dict)
     zapret_table_layout: dict[str, Any] = field(default_factory=dict)
+    onboarding_revision: int = 0         # последняя пройденная ревизия приветствия
+    onboarding_version: str = ""         # версия Lumen, на которой приветствие закрыто ("" — новая установка)
 
     def __post_init__(self) -> None:
         from .routing_presets import normalize_regional_preset
@@ -577,6 +585,10 @@ class AppSettings:
             "window_y": self.window_y,
             "zapret_preset": self.zapret_preset,
             "zapret_autostart": self.zapret_autostart,
+            "zapret_server_presets": dict(self.zapret_server_presets),
+            "proxy_chain_enabled": self.proxy_chain_enabled,
+            "proxy_chain_front_node_id": self.proxy_chain_front_node_id,
+            "proxy_chain_exit_node_id": self.proxy_chain_exit_node_id,
             "auto_switch_enabled": self.auto_switch_enabled,
             "auto_switch_threshold_kbps": self.auto_switch_threshold_kbps,
             "auto_switch_delay_sec": self.auto_switch_delay_sec,
@@ -609,6 +621,8 @@ class AppSettings:
             "ui_wallpaper_blur": self.ui_wallpaper_blur,
             "ui_wallpaper_brightness": self.ui_wallpaper_brightness,
             "diagnostics_upload_enabled": self.diagnostics_upload_enabled,
+            "onboarding_revision": self.onboarding_revision,
+            "onboarding_version": self.onboarding_version,
         }
 
     @staticmethod
@@ -701,6 +715,10 @@ class AppSettings:
             window_y=int(data.get("window_y", -1)),
             zapret_preset=str(data.get("zapret_preset") or ""),
             zapret_autostart=bool(data.get("zapret_autostart", False)),
+            zapret_server_presets=_normalize_zapret_server_presets(data.get("zapret_server_presets")),
+            proxy_chain_enabled=bool(data.get("proxy_chain_enabled", False)),
+            proxy_chain_front_node_id=str(data.get("proxy_chain_front_node_id") or "").strip(),
+            proxy_chain_exit_node_id=str(data.get("proxy_chain_exit_node_id") or "").strip(),
             auto_switch_enabled=bool(data.get("auto_switch_enabled", False)),
             auto_switch_threshold_kbps=int(data.get("auto_switch_threshold_kbps") or 50),
             auto_switch_delay_sec=int(data.get("auto_switch_delay_sec") or 30),
@@ -733,6 +751,8 @@ class AppSettings:
             ui_wallpaper_blur=int(data.get("ui_wallpaper_blur") if data.get("ui_wallpaper_blur") is not None else 10),
             ui_wallpaper_brightness=int(data.get("ui_wallpaper_brightness") if data.get("ui_wallpaper_brightness") is not None else 50),
             diagnostics_upload_enabled=bool(data.get("diagnostics_upload_enabled", True)),
+            onboarding_revision=_normalize_onboarding_revision(data.get("onboarding_revision")),
+            onboarding_version=_normalize_onboarding_version(data),
         )
 
 
@@ -877,6 +897,35 @@ def _normalize_local_port(value: Any, default: int) -> int:
     if port < 1025 or port > 65535 or port == 10818:  # 10818 is reserved for droute Discord Voice
         return default
     return port
+
+
+def _normalize_onboarding_revision(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalize_zapret_server_presets(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, str] = {}
+    for node_id, preset in value.items():
+        key = str(node_id or "").strip()
+        if key:
+            result[key] = str(preset or "").strip()
+    return result
+
+
+def _normalize_onboarding_version(data: dict[str, Any]) -> str:
+    from .release_notes import LEGACY_PROFILE_VERSION, normalize_seen_version
+
+    # Profiles saved before 2.0 have no key at all: they belong to users who
+    # upgraded, so they must get the "What's new" page (fresh installs start
+    # from AppSettings() with an empty value instead).
+    if "onboarding_version" not in data:
+        return LEGACY_PROFILE_VERSION
+    return normalize_seen_version(data.get("onboarding_version"))
 
 
 def _normalize_language(value: Any) -> str:

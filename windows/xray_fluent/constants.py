@@ -7,11 +7,17 @@ from .data_paths import resolve_data_dir, seed_user_data
 
 
 APP_NAME = "Lumen"
-APP_VERSION = "1.9.18"
+APP_VERSION = "2.0.0"
 STATE_SCHEMA_VERSION = 1
 # Bump when parsing/reconciliation semantics change; cached validators remain
 # useful, while the value lets future migrations force one clean reconcile.
 SUBSCRIPTION_PARSER_REVISION = 4
+# Onboarding revision. Users whose saved revision is lower walk through the
+# setup part of the welcome flow on the next launch (fresh installs and
+# upgrades alike). Bump it when a release should run the setup again. The
+# "What's new" part is shown after every version upgrade independently.
+ONBOARDING_REVISION = 1
+RECOMMENDED_VPN_URL = "https://t.me/zapretvpns_bot"
 SUBSCRIPTION_FETCHER_EXE_NAME = "lumen-subscription-fetcher.exe"
 
 DIAGNOSTICS_UPLOAD_URL = "https://diagnostics.lumen-kvn.eu.cc/api/ingest"

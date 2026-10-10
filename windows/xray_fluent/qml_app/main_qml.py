@@ -14,6 +14,7 @@ from ..deeplinks import (
     decode_instance_message,
     encode_instance_message,
     find_lumen_deep_link,
+    parse_instance_message,
 )
 
 
@@ -519,6 +520,17 @@ def _cleanup_legacy_executable_bridge() -> None:
         pass
 
 
+def _should_start_in_tray(
+    arguments: list[str] | tuple[str, ...],
+    initial_deep_link: str = "",
+) -> bool:
+    """Hide only genuine OS-autostarts, never an app-initiated relaunch."""
+    args = list(arguments)
+    flags = set(str(a or "").strip() for a in (args[1:] if len(args) > 1 else args))
+    internal_relaunch = bool(flags & {"--relaunched", "--relaunch-as-admin"})
+    return "--tray" in flags and not internal_relaunch and not bool(initial_deep_link)
+
+
 def _notify_primary_instance(
     server_name: str,
     launch_arguments: list[str] | tuple[str, ...] = (),
@@ -528,7 +540,10 @@ def _notify_primary_instance(
         from PyQt6.QtNetwork import QLocalSocket
     except Exception:
         return False
-    if sys.platform == "win32":
+    start_in_tray = _should_start_in_tray(
+        launch_arguments, find_lumen_deep_link(launch_arguments)
+    )
+    if sys.platform == "win32" and not start_in_tray:
         try:
             # The process that the user just launched is allowed to put a window
             # in the foreground. Transfer that permission before asking the
@@ -861,12 +876,6 @@ def _install_crash_guards() -> None:
         pass
 
 
-def _should_start_in_tray(arguments: list[str], initial_deep_link: str = "") -> bool:
-    """Hide only genuine OS-autostarts, never an app-initiated relaunch."""
-    flags = set(arguments[1:])
-    internal_relaunch = bool(flags & {"--relaunched", "--relaunch-as-admin"})
-    return "--tray" in flags and not internal_relaunch and not initial_deep_link
-
 
 def _load_bundled_fonts() -> None:
     try:
@@ -1040,13 +1049,14 @@ def main(argv: list[str] | None = None) -> int:
                 return
             state["done"] = True
             active_connections.discard(conn)
-            deep_link = decode_instance_message(bytes(state["data"]))
+            command, deep_link = parse_instance_message(bytes(state["data"]))
             try:
                 conn.disconnectFromServer()
                 conn.deleteLater()
             except Exception:
                 pass
-            _activate_window(window)
+            if command != "tray":
+                _activate_window(window)
             if deep_link:
                 bridge.handleDeepLink(deep_link)
 
@@ -1127,7 +1137,7 @@ def main(argv: list[str] | None = None) -> int:
     from PyQt6.QtWidgets import QSystemTrayIcon
     from .tray import QmlTray
 
-    tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+    tray_available = QSystemTrayIcon.isSystemTrayAvailable() or sys.platform == "win32"
     bridge.set_tray_available(tray_available)
     app.setQuitOnLastWindowClosed(not tray_available)
     def _request_reveal(*, activate: bool = False) -> None:

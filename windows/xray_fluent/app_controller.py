@@ -11,7 +11,8 @@ from datetime import datetime
 import json
 from pathlib import Path
 
-from .constants import APP_VERSION, DIAGNOSTICS_UPLOAD_URL
+from .constants import APP_VERSION, DATA_DIR, DIAGNOSTICS_UPLOAD_URL
+from . import bootstrap_dns
 from .bounded_logs import LogRing
 from .logging_setup import configure_diagnostics_upload, configure_logging, get_logger
 from .diagnostics_uploader import get_upload_epoch, uploads_allowed, upload_bundle
@@ -65,6 +66,7 @@ from .application.nodes import (
     get_next_node_for_auto_switch as get_next_node_for_auto_switch_operation,
     get_node_by_id as get_node_by_id_operation,
     import_nodes_from_text as import_nodes_from_text_operation,
+    import_parsed_nodes as import_parsed_nodes_operation,
     import_subscription as import_subscription_operation,
     on_countries_resolved as on_countries_resolved_operation,
     prepare_node_for_runtime as prepare_node_for_runtime_operation,
@@ -172,6 +174,7 @@ from .log_utils import classify_log_level, clean_log_text
 from .models import AppSettings, AppState, Node, RoutingSettings
 from .network_monitor import NetworkMonitor
 from .proxy_manager import ProxyManager
+from .proxy_chain import ProxyChain, resolve_proxy_chain
 from .process_conflicts import scan_network_conflicts
 from .routing_presets import (
     build_routing_preset,
@@ -194,6 +197,13 @@ from .startup import (
 )
 from .traffic_history import TrafficHistoryStorage
 from .zapret_manager import ZapretManager
+from .zapret_server_scope import (
+    ZapretServerScope,
+    cached_server_ips,
+    make_server_scope,
+    node_endpoint,
+    resolve_server_ips,
+)
 
 if TYPE_CHECKING:
     from .connectivity_test import ConnectivityTestWorker
@@ -456,6 +466,17 @@ class AppController(QObject):
         self.singbox.stopped.connect(lambda code: self._on_core_stopped("singbox", code))
 
         self.zapret.log_line.connect(lambda line: self._queue_core_log("zapret", line), Qt.ConnectionType.DirectConnection)
+        # Bound preset limited to the connected server (see sync_zapret_server_binding).
+        self._zapret_scope_token = 0
+        self._zapret_desired_scope: ZapretServerScope | None = None
+        self._zapret_dns_executor: ThreadPoolExecutor | None = None
+        self._zapret_binding_warned_node = ""
+        self._zapret_autostart_done = False
+        # Server part for which a reconnect was already requested (see sync_zapret_server_binding).
+        self._zapret_reconnect_signature: tuple | None = None
+        # Trusted server addresses survive restarts (last DoH answer, up to 7 days).
+        bootstrap_dns.configure_cache(DATA_DIR / "bootstrap-lkg.json")
+        self.zapret.stopped.connect(self._on_zapret_stopped_for_binding)
 
         self.network_monitor.network_changed.connect(self._on_network_changed)
 
@@ -1314,7 +1335,8 @@ class AppController(QObject):
             preferred_protect_port = session.protect_ss_port
             preferred_protect_password = session.protect_ss_password
         runtime_routing = self._runtime_routing()
-        return plan_singbox_runtime(
+        proxy_chain = self._resolve_proxy_chain(node)
+        plan = plan_singbox_runtime(
             document,
             node,
             routing=runtime_routing,
@@ -1350,7 +1372,232 @@ class AppController(QObject):
             tun_mode=tun_mode,
             enable_hot_switch=True,
             hot_switch_nodes=tuple(self.state.nodes),
+            proxy_chain=proxy_chain,
         )
+        if proxy_chain is not None:
+            for note in proxy_chain.notes:
+                self._log(f"[chain] {note}")
+            if proxy_chain.active:
+                self._log(f"[chain] sing-box: {proxy_chain.describe(node)}")
+        return plan
+
+    def _resolve_proxy_chain(self, node: Node | None) -> ProxyChain | None:
+        """Chain hops for the given main server, or None when the chain is off."""
+        if node is None:
+            return None
+        return resolve_proxy_chain(self.state.settings, self.state.nodes, node)
+
+    # ── Zapret: autostart and "run together with server" ────────────────
+    def zapret_preset_for_node(self, node_id: str | None) -> str | None:
+        """Preset bound to the server, "" when bound to the current preset, None if unbound."""
+        key = str(node_id or "").strip()
+        presets = getattr(self.state.settings, "zapret_server_presets", None) or {}
+        if not key or key not in presets:
+            return None
+        return str(presets.get(key) or "").strip() or str(self.state.settings.zapret_preset or "").strip()
+
+    def _on_zapret_stopped_for_binding(self) -> None:
+        # Any stop (user, crash) cancels a server lookup that is still running.
+        self._zapret_scope_token += 1
+
+    def start_zapret_preset(self, preset: str) -> None:
+        """Start a preset by hand, keeping the bound preset for the server."""
+        self.zapret.start(preset, server_scope=self._zapret_desired_scope)
+
+    def stop_zapret_manual(self) -> None:
+        """Stop the manual strategy; the server-only part keeps running."""
+        zapret = self.zapret
+        scope = zapret.server_scope
+        if scope is not None and zapret.current_preset and is_process_elevated():
+            self._log(f"[zapret] ручной пресет остановлен, {scope.title} остаётся для сервера")
+            zapret.start("", server_scope=scope)
+            return
+        zapret.stop()
+
+    def _zapret_pre_connect_target(self, action: str) -> tuple[Any, str, str] | None:
+        """(node, preset, host) when Zapret must run for the server before the core dials it."""
+        if action not in ("connect", "reconnect", "proxy_hot_swap", "tun_hot_swap") or self._shutting_down:
+            return None
+        node = self.selected_node
+        preset = self.zapret_preset_for_node(node.id) if node is not None else None
+        if not preset or not is_process_elevated():
+            return None
+        host, port = node_endpoint(node)
+        if not host or not port:
+            return None
+        return node, preset, host
+
+    def _zapret_pre_connect_host(self, action: str) -> str:
+        """Server name that still has to be resolved before the transition may start."""
+        target = self._zapret_pre_connect_target(action)
+        if target is None:
+            return ""
+        _node, _preset, host = target
+        return "" if cached_server_ips(host) else host
+
+    def _prepare_zapret_scope_before_connect(self, action: str) -> None:
+        """Start the server-only Zapret part before the core dials the server.
+
+        The handshake then already goes through the strategy and the live
+        session is not hit by a winws2 restart afterwards. The address comes
+        from an IP literal or the cache; ``_execute_transition_action``
+        resolves a missing one first (bounded wait) so winws2 starts first.
+        """
+        target = self._zapret_pre_connect_target(action)
+        if target is None:
+            return
+        node, preset, host = target
+        ips = cached_server_ips(host)
+        if not ips:
+            return
+        scope = make_server_scope(node, preset, ips)
+        if scope is None:
+            return
+        zapret = self.zapret
+        current = zapret.server_scope if zapret.running else None
+        if current is not None and current.signature() == scope.signature() and current.ips == scope.ips:
+            return
+        self._zapret_scope_token += 1
+        self._zapret_desired_scope = scope
+        self._log(f"[zapret] {scope.title} для сервера {scope.label} запускается до подключения")
+        zapret.start(zapret.current_preset if zapret.running else "", server_scope=scope)
+
+    def _zapret_dns_pool(self) -> ThreadPoolExecutor:
+        if self._zapret_dns_executor is None:
+            self._zapret_dns_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zapret-dns")
+        return self._zapret_dns_executor
+
+    def _resolve_zapret_server_ips(self, host: str, callback) -> None:
+        """Resolve the server address off the UI thread, then call back on it."""
+        future = self._zapret_dns_pool().submit(resolve_server_ips, host)
+        deadline = time.monotonic() + 6.0
+
+        def poll() -> None:
+            if future.done():
+                try:
+                    ips = tuple(future.result())
+                except Exception:  # noqa: BLE001
+                    ips = ()
+                callback(ips)
+            elif time.monotonic() > deadline:
+                callback(())
+            else:
+                QTimer.singleShot(50, poll)
+
+        poll()
+
+    def _prefetch_zapret_server_ips(self) -> None:
+        """Learn the real addresses of every bound server in the background.
+
+        A later connect or hot swap to any of them can then start winws2
+        before the core without waiting for DNS (the lookup is trusted DoH,
+        so it is also safe while TUN fake-ip DNS is active).
+        """
+        if self._shutting_down:
+            return
+        bindings = getattr(self.state.settings, "zapret_server_presets", None) or {}
+        hosts: list[str] = []
+        for node_id in bindings:
+            node = self._get_node_by_id(node_id)
+            host, _ = node_endpoint(node) if node is not None else ("", 0)
+            if host and host not in hosts and not cached_server_ips(host):
+                hosts.append(host)
+        for host in hosts:
+            self._zapret_dns_pool().submit(resolve_server_ips, host)
+
+    def sync_zapret_server_binding(self) -> None:
+        """Apply the bound preset to the connected server's traffic only.
+
+        The bound preset is limited to the server IP/port and runs in the same
+        winws2 process as the preset started by hand (which keeps handling all
+        other traffic). On disconnect only the manual preset stays running.
+        """
+        if self._shutting_down:
+            return
+        session = self._active_session
+        node_id = str(getattr(session, "node_id", "") or "") if self.connected and session is not None else ""
+        preset = self.zapret_preset_for_node(node_id) if node_id else None
+        zapret = self.zapret
+        node = self._get_node_by_id(node_id) if preset else None
+        if not preset or node is None:
+            if preset == "" and node_id:
+                self._log("[zapret] сервер привязан к Zapret, но пресет не выбран")
+            self._zapret_scope_token += 1
+            self._zapret_desired_scope = None
+            if zapret.server_scope is not None:
+                manual = zapret.current_preset
+                if manual and is_process_elevated():
+                    self._log(f"[zapret] сервер отключён — остаётся только пресет {manual}")
+                    zapret.start(manual)
+                else:
+                    self._log("[zapret] сервер отключён — останавливаю Zapret для сервера")
+                    zapret.stop()
+            self._prefetch_zapret_server_ips()
+            return
+        host, port = node_endpoint(node)
+        label = str(getattr(node, "name", "") or host or node_id)
+        if not host or not port:
+            self._log(f"[zapret] у сервера {label} нет адреса — Zapret для него не запущен")
+            return
+        current = zapret.server_scope if zapret.running else None
+        probe = make_server_scope(node, preset, current.ips if current is not None else ("192.0.2.1",))
+        if probe is None:
+            self._log(f"[zapret] для сервера {label} не найдена стратегия — Zapret для него не запущен")
+            return
+        if current is not None and current.signature() == probe.signature():
+            self._zapret_reconnect_signature = None
+            return
+        if not is_process_elevated():
+            if self._zapret_binding_warned_node != node_id:
+                self._zapret_binding_warned_node = node_id
+                self.status.emit("warning", "Zapret для этого сервера не запущен: нужны права администратора")
+            return
+        if (
+            current is not None
+            and current.node_id == node_id
+            and self._zapret_reconnect_signature != probe.signature()
+            and not getattr(self, "_transition_active", False)
+        ):
+            # The live session was set up through the previous strategy: let the
+            # reconnect start winws2 with the new one before the new handshake.
+            self._zapret_reconnect_signature = probe.signature()
+            self._log(f"[zapret] Zapret для сервера {label} изменён — переподключение через {probe.title}")
+            self._resume_reconnect_pending = True
+            self._request_transition("zapret server strategy changed")
+            return
+        self._zapret_scope_token += 1
+        token = self._zapret_scope_token
+
+        def apply(ips: tuple[str, ...]) -> None:
+            if token != self._zapret_scope_token or self._shutting_down:
+                return
+            if not ips:
+                self._log(f"[zapret] не удалось определить IP сервера {host} — Zapret для сервера не запущен")
+                self.status.emit("warning", "Zapret для сервера не запущен: не удалось определить IP сервера")
+                return
+            scope = make_server_scope(node, preset, ips)
+            if scope is None:
+                return
+            self._zapret_desired_scope = scope
+            manual = zapret.current_preset if zapret.running else ""
+            self._log(f"[zapret] запуск вместе с сервером {label}: {scope.title} (только трафик сервера)")
+            zapret.start(manual, server_scope=scope)
+
+        self._resolve_zapret_server_ips(host, apply)
+
+    def _maybe_autostart_zapret(self) -> None:
+        if self._zapret_autostart_done:
+            return
+        self._zapret_autostart_done = True
+        settings = self.state.settings
+        preset = str(settings.zapret_preset or "").strip()
+        if not settings.zapret_autostart or not preset or self.zapret.current_preset:
+            return
+        if not is_process_elevated():
+            self._log("[zapret] автозапуск пропущен: нужны права администратора")
+            return
+        self._log(f"[zapret] автозапуск пресета {preset}")
+        self.start_zapret_preset(preset)
 
     def _start_singbox_runtime_plan(self, plan: SingboxRuntimePlan) -> bool:
         if plan.xray_sidecar is not None:
@@ -1711,6 +1958,29 @@ class AppController(QObject):
         if reason == "system resume" and not self._desired_connected:
             self._transition_completed.emit(True, action, reason, generation)
             return
+        try:
+            host = self._zapret_pre_connect_host(action)
+        except Exception as exc:  # noqa: BLE001 - Zapret must never block a connect
+            self._log(f"[zapret] не удалось подготовить Zapret для сервера: {exc}")
+            host = ""
+        if host:
+            # winws2 has to be running before the core dials the bound server,
+            # otherwise the first handshake goes out without the strategy.
+            self._log(f"[zapret] определяю IP сервера {host} перед подключением")
+
+            def resume(_ips: tuple[str, ...]) -> None:
+                if self._transition_active and not self._shutting_down:
+                    self._start_transition_worker(action, reason, generation)
+
+            self._resolve_zapret_server_ips(host, resume)
+            return
+        self._start_transition_worker(action, reason, generation)
+
+    def _start_transition_worker(self, action: str, reason: str, generation: int) -> None:
+        try:
+            self._prepare_zapret_scope_before_connect(action)
+        except Exception as exc:  # noqa: BLE001 - Zapret must never block a connect
+            self._log(f"[zapret] не удалось подготовить Zapret для сервера: {exc}")
 
         def _run() -> None:
             ok = False
@@ -1781,6 +2051,8 @@ class AppController(QObject):
             and not self.state.settings.tun_mode
         ):
             QTimer.singleShot(250, self.apply_discord_proxy)
+        if ok or was_connected != is_connected or self.zapret.server_scope is not None:
+            QTimer.singleShot(0, self.sync_zapret_server_binding)
         if ok:
             self._blocked_transition_signature = ""
         else:
@@ -1879,6 +2151,8 @@ class AppController(QObject):
             self._flush_state_saves(timeout=max(0.0, deadline - time.monotonic()))
             self._save_executor_shutdown = True
             self._save_executor.shutdown(wait=False, cancel_futures=False)
+            if self._zapret_dns_executor is not None:
+                self._zapret_dns_executor.shutdown(wait=False, cancel_futures=True)
             configure_diagnostics_upload(upload_url="", app_version=APP_VERSION)
 
     def finalize_shutdown(self) -> None:
@@ -1979,6 +2253,25 @@ class AppController(QObject):
         return import_nodes_from_text_operation(
             self,
             text,
+            group=group,
+            auto_connect=auto_connect,
+            select_imported=select_imported,
+        )
+
+    def import_parsed_nodes(
+        self,
+        nodes: list[Node],
+        *,
+        group: str | None = None,
+        auto_connect: bool | None = None,
+        select_imported: bool = False,
+    ) -> tuple[int, list[str]]:
+        if not self.profile_loaded:
+            self.status.emit("warning", "Сначала откройте зашифрованный профиль")
+            return (0, ["Сначала откройте зашифрованный профиль"])
+        return import_parsed_nodes_operation(
+            self,
+            nodes,
             group=group,
             auto_connect=auto_connect,
             select_imported=select_imported,
@@ -2659,6 +2952,8 @@ class AppController(QObject):
         if not self.profile_loaded:
             self.status.emit("warning", "Сначала откройте зашифрованный профиль")
             return None
+        self._maybe_autostart_zapret()
+        self._prefetch_zapret_server_ips()
         if not self.state.settings.auto_connect_last or self.locked:
             return
         if self.selected_node is None and not self._can_connect_without_selected_node():

@@ -36,6 +36,8 @@ from ...constants import (
     DEFAULT_DISCORD_SOCKS_PORT,
     DEFAULT_HTTP_PORT,
     DEFAULT_SOCKS_PORT,
+    ONBOARDING_REVISION,
+    RECOMMENDED_VPN_URL,
     SPEED_TEST_MAX_CONCURRENCY,
     SUBSCRIPTION_PARSER_REVISION,
 )
@@ -46,7 +48,8 @@ from ...models import Node, RoutingSettings
 from ...node_transport import node_transport
 from ...process_conflicts import scan_network_conflicts, terminate_scanned_conflicts
 from ...qthread_utils import retain_thread_until_finished, stop_and_wait_for_thread
-from ...routing_rule_import import parse_routing_rules
+from ...release_notes import LEGACY_PROFILE_VERSION, is_upgrade, notes_between, version_key
+from ...routing_rule_import import normalize_routing_address, parse_routing_rules, split_routing_addresses
 from ...startup import is_process_elevated, relaunch_as_admin
 from .log_model import LogFilterModel, LogModel
 from .node_list_model import NodeListModel
@@ -223,6 +226,8 @@ class AppBridge(QObject):
     subscriptionImportingChanged = pyqtSignal()
     subscriptionImportStatusChanged = pyqtSignal()
     regionalPresetBusyChanged = pyqtSignal()
+    onboardingChanged = pyqtSignal()       # welcome flow state or server count changed
+    warpGenerationChanged = pyqtSignal()   # WARP profile generation started/finished
 
     # Внутренний: запуск фоновой загрузки подписок (jobs, batch_id)
     _sub_fetch_run = pyqtSignal(object, int)
@@ -231,7 +236,7 @@ class AppBridge(QObject):
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._node_model = NodeListModel(self)
-        self._log_source_model = LogModel(parent=self)
+        self._log_source_model = LogModel(parent=self, translator=self._localized_backend_message)
         self._log_model = LogFilterModel(self._log_source_model, parent=self)
         self._pending_ui_logs = LogRing[str](maxlen=2000)
         self._log_flush_timer = QTimer(self)
@@ -259,6 +264,8 @@ class AppBridge(QObject):
         self._app_update_checker: QThread | None = None
         self._app_update_downloader: QThread | None = None
         self._startup_resource_worker: QThread | None = None
+        self._warp_worker: QThread | None = None
+        self._warp_added = 0
         self._pending_regional_preset = ""
         self._sub_batches: dict[int, dict] = {}
         self._sub_batch_seq = 0
@@ -457,7 +464,7 @@ class AppBridge(QObject):
                 worker.stop()
             thread.quit()
             waiting.append((thread, "cancelled subscription thread"))
-        for attribute in ("_app_update_checker", "_startup_resource_worker", "_app_update_downloader"):
+        for attribute in ("_app_update_checker", "_startup_resource_worker", "_app_update_downloader", "_warp_worker"):
             worker = getattr(self, attribute, None)
             if worker is not None:
                 if hasattr(worker, "cancel"):
@@ -1083,11 +1090,17 @@ class AppBridge(QObject):
                 self._notify_action(level, localized, "reset-system-proxy", tr("Сбросить"))
                 return
             entry = parse_log_line(localized)
+            if entry.message != entry.details:
+                summary = self._localized_backend_message(entry.message)
+                details = self._localized_backend_message(entry.details)
+                hint = details.split(". ", 1)[0] + "."
+                if entry.action_id:
+                    self._notify_action(level, summary + "\n" + hint, entry.action_id, tr(entry.action_label))
+                    return
+                self._notify(level, summary + "\n" + hint)
+                return
             if entry.action_id:
                 self._notify_action(level, entry.message + "\n" + entry.details.split(". ", 1)[0] + ".", entry.action_id, tr(entry.action_label))
-                return
-            if entry.message != entry.details:
-                self._notify(level, entry.message + "\n" + entry.details.split(". ", 1)[0] + ".")
                 return
         self._notify(level, localized)
 
@@ -1095,6 +1108,7 @@ class AppBridge(QObject):
     def _on_nodes_changed(self, nodes: list[Node]) -> None:
         self._apply_node_model()
         self.nodeFiltersChanged.emit()
+        self.onboardingChanged.emit()
 
     def _apply_node_model(self) -> None:
         """Re-push the controller's nodes into the model honouring the active
@@ -1258,6 +1272,7 @@ class AppBridge(QObject):
         self._accent = settings.accent_color or "#0078D4"
         self._node_model.set_runtime_support(True)
         self.settingsChanged.emit()
+        self.onboardingChanged.emit()
         # These values are exposed as independently bindable properties in
         # QML.  Keep their notify signals in sync when a profile load/import
         # or another settings update replaces the whole settings object.
@@ -1268,6 +1283,7 @@ class AppBridge(QObject):
 
     def _on_subscriptions_changed(self, _subscriptions=None) -> None:
         self.subscriptionsChanged.emit()
+        self.onboardingChanged.emit()
 
     def _on_ping(self, node_id: str, ping_ms) -> None:
         self._node_model.update_ping(node_id, ping_ms)
@@ -1669,6 +1685,122 @@ class AppBridge(QObject):
             self.toast.emit("warning", tr("Не удалось получить системный акцент"))
             return
         self.setAccent(hex_color)
+
+    @pyqtSlot(result=bool)
+    def applySystemAccentQuietly(self) -> bool:
+        """Use the Windows accent without a warning toast (welcome flow)."""
+        hex_color = self.systemAccent()
+        if not hex_color:
+            return False
+        self.setAccent(hex_color)
+        return True
+
+    # ── Onboarding (welcome flow) ────────────────────────────────
+    @pyqtSlot()
+    def completeOnboarding(self) -> None:
+        """Mark the setup revision and the current release as seen."""
+        settings = deepcopy(self.controller.state.settings)
+        changed = False
+        if int(getattr(settings, "onboarding_revision", 0) or 0) < ONBOARDING_REVISION:
+            settings.onboarding_revision = ONBOARDING_REVISION
+            changed = True
+        seen = str(getattr(settings, "onboarding_version", "") or "")
+        # Never move the marker backwards after a downgrade.
+        if version_key(seen) < version_key(APP_VERSION):
+            settings.onboarding_version = APP_VERSION
+            changed = True
+        if changed:
+            self.controller.update_settings(settings)
+
+    @pyqtSlot()
+    def showOnboardingAgain(self) -> None:
+        """Reopen the welcome flow on demand (About page)."""
+        settings = deepcopy(self.controller.state.settings)
+        settings.onboarding_revision = 0
+        self.controller.update_settings(settings)
+
+    # ── WARP profiles in one click ───────────────────────────────
+    @pyqtSlot()
+    def generateWarpConfigs(self) -> None:
+        """Register free Cloudflare WARP profiles (AmneziaWG + MASQUE) in the background."""
+        from ...http_utils import urlopen_proxy_first
+        from ...warp_generator import WarpGenerationWorker
+
+        if self._quitting or self._warp_worker is not None:
+            return
+        if not self.controller.profile_loaded:
+            self.toast.emit("warning", tr("Сначала откройте зашифрованный профиль"))
+            return
+        proxy_url = None
+        if self.controller.connected:
+            try:
+                if self.controller.get_effective_http_proxy_port():
+                    proxy_url = self.controller.get_effective_http_proxy_url()
+            except Exception:
+                proxy_url = None
+
+        def open_url(request, timeout):
+            return urlopen_proxy_first(request, timeout=timeout, proxy_url=proxy_url)
+
+        worker = WarpGenerationWorker(open_url)
+        self._warp_worker = worker
+        worker.done.connect(self._on_warp_generated)
+        worker.finished.connect(self._clear_warp_worker)
+        self.warpGenerationChanged.emit()
+        worker.start()
+
+    def _clear_warp_worker(self) -> None:
+        worker = self.sender()
+        if self._warp_worker is worker:
+            self._warp_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self.warpGenerationChanged.emit()
+
+    def _on_warp_generated(self, result, error: str) -> None:
+        from ...warp_generator import WARP_GROUP
+
+        if self._quitting:
+            return
+        logger = logging.getLogger("xray_fluent.app")
+        if result is None:
+            logger.warning("[warp] generation failed: %s", scrub_text(error))
+            self.toast.emit(
+                "error",
+                tr("Не удалось получить профили WARP. Проверьте интернет и попробуйте ещё раз."),
+            )
+            return
+        for problem in result.errors:
+            logger.warning("[warp] partial failure: %s", scrub_text(problem))
+        existing_ids = {node.id for node in self.controller.state.nodes}
+        added, errors = self.controller.import_parsed_nodes(
+            list(result.nodes),
+            group=WARP_GROUP,
+            auto_connect=False,
+            select_imported=not self.controller.state.selected_node_id,
+        )
+        for problem in errors:
+            logger.warning("[warp] import problem: %s", scrub_text(problem))
+        if added:
+            self._warp_added += added
+            imported_id = next(
+                (node.id for node in self.controller.state.nodes if node.id not in existing_ids),
+                "",
+            )
+            if imported_id:
+                self.nodeImported.emit(imported_id)
+            self.toast.emit("success", tr("Добавлено профилей WARP: {count}", count=added))
+        else:
+            self.toast.emit("warning", tr("Не удалось добавить профили WARP"))
+        self.warpGenerationChanged.emit()
+
+    @pyqtProperty(bool, notify=warpGenerationChanged)
+    def warpGenerating(self) -> bool:
+        return getattr(self, "_warp_worker", None) is not None
+
+    @pyqtProperty(int, notify=warpGenerationChanged)
+    def warpGeneratedCount(self) -> int:
+        return int(getattr(self, "_warp_added", 0) or 0)
 
     @pyqtSlot(str)
     def setInterfaceMode(self, mode: str) -> None:
@@ -3182,6 +3314,7 @@ class AppBridge(QObject):
     # ── Zapret tab ──────────────────────────────────────────────
     zapretState = pyqtSignal("QVariantMap")        # {running, preset, error}
     zapretPresetsChanged = pyqtSignal()            # preset list changed
+    zapretBindingsChanged = pyqtSignal()           # server -> preset bindings changed
 
     def _ensure_zapret_wired(self) -> None:
         if getattr(self, "_zapret_wired", False):
@@ -3205,16 +3338,43 @@ class AppBridge(QObject):
     def zapretStatus(self):
         self._ensure_zapret_wired()
         try:
-            running = bool(self.controller.zapret.running)
+            running = self._zapret_manual_running()
         except Exception:
             running = False
         preset = ""
         try:
             if running:
-                preset = self.controller.state.settings.zapret_preset or ""
+                preset = self._zapret_active_preset()
         except Exception:
             preset = ""
-        return {"running": running, "preset": preset, "error": ""}
+        return {"running": running, "preset": preset, "serverPreset": self._zapret_server_preset(), "error": ""}
+
+    def _zapret_manual_running(self) -> bool:
+        """Zapret counts as running only for a strategy started in full.
+
+        The server-only part of a binding runs silently and does not light up
+        the Zapret status.
+        """
+        zapret = self.controller.zapret
+        if not zapret.running:
+            return False
+        return bool(zapret.current_preset) or getattr(zapret, "server_scope", None) is None
+
+    def _zapret_active_preset(self) -> str:
+        zapret = self.controller.zapret
+        if zapret.current_preset:
+            return zapret.current_preset
+        # Only the server-limited part is running: no manual preset is active.
+        if getattr(zapret, "server_scope", None) is not None:
+            return ""
+        return self.controller.state.settings.zapret_preset or ""
+
+    def _zapret_server_preset(self) -> str:
+        try:
+            scope = getattr(self.controller.zapret, "server_scope", None)
+        except Exception:
+            return ""
+        return str(scope.preset) if scope is not None else ""
 
     @pyqtSlot(str)
     def startZapret(self, preset_name: str) -> None:
@@ -3233,7 +3393,8 @@ class AppBridge(QObject):
                     tr("Перезапустить от администратора"),
                 )
                 return
-            self.controller.zapret.start(name)
+            self.controller.start_zapret_preset(name)
+            QTimer.singleShot(0, self.controller.sync_zapret_server_binding)
         except Exception as exc:  # noqa: BLE001
             self.zapretState.emit({"running": False, "preset": "", "error": str(exc)})
 
@@ -3241,7 +3402,7 @@ class AppBridge(QObject):
     def stopZapret(self) -> None:
         self._ensure_zapret_wired()
         try:
-            self.controller.zapret.stop()
+            self.controller.stop_zapret_manual()
         except Exception as exc:  # noqa: BLE001
             self.zapretState.emit({"running": False, "preset": "", "error": str(exc)})
 
@@ -3270,13 +3431,49 @@ class AppBridge(QObject):
         except Exception as exc:  # noqa: BLE001
             self.toast.emit("error", tr("Не удалось сохранить пресет: {error}", error=exc))
 
+    @pyqtSlot(str, str, str, str, result=bool)
+    def saveRenamedPreset(self, old_name: str, name: str, description: str, content: str) -> bool:
+        """Rename an existing preset and save its new content in one step.
+
+        Server bindings and the remembered preset follow the new name.
+        """
+        from ...zapret_manager import ZapretManager
+        old_name = (old_name or "").strip()
+        name = (name or "").strip()
+        if not old_name or old_name == name:
+            self.savePreset(name, description, content)
+            return True
+        if any(c in '\\/:*?"<>|' for c in name) or not name:
+            self.toast.emit("warning", tr("Недопустимое имя пресета"))
+            return False
+        try:
+            if ZapretManager.rename_preset(old_name, name) is None:
+                self.toast.emit("warning", tr("Пресет с именем «{name}» уже есть", name=name))
+                return False
+        except Exception as exc:  # noqa: BLE001
+            self.toast.emit("error", tr("Не удалось сохранить пресет: {error}", error=exc))
+            return False
+        settings = deepcopy(self.controller.state.settings)
+        if settings.zapret_preset == old_name:
+            settings.zapret_preset = name
+        settings.zapret_server_presets = {
+            node_id: (name if preset == old_name else preset)
+            for node_id, preset in (settings.zapret_server_presets or {}).items()
+        }
+        self.controller.update_settings(settings)
+        self.zapretBindingsChanged.emit()
+        self.savePreset(name, description, content)
+        return True
+
     @pyqtSlot(str)
     def deletePreset(self, name: str) -> None:
         from ...zapret_manager import ZapretManager
         if not name:
             return
         try:
-            if self.controller.zapret.running and name == self.controller.state.settings.zapret_preset:
+            if self.controller.zapret.running and name == (
+                self.controller.zapret.current_preset or self.controller.state.settings.zapret_preset
+            ):
                 self.controller.zapret.stop()
             ZapretManager.delete_preset(name)
             self.toast.emit("success", tr("Пресет удалён: {name}", name=name))
@@ -3306,12 +3503,225 @@ class AppBridge(QObject):
         self.zapretPresetsChanged.emit()
         return info.name
 
+    # ── Zapret: run together with a server ────────────────────────────
+    @staticmethod
+    def _node_option_label(node: Node) -> str:
+        name = str(node.name or "").strip() or f"{node.server}:{node.port}"
+        group = str(getattr(node, "group", "") or "").strip()
+        return f"{name} · {group}" if group else name
+
+    @pyqtSlot(result="QVariantList")
+    def zapretServerBindings(self):
+        settings = self.controller.state.settings
+        presets = dict(getattr(settings, "zapret_server_presets", None) or {})
+        known = {info.get("name") for info in self.zapretPresets() if isinstance(info, dict)}
+        session = getattr(self.controller, "_active_session", None)
+        connected_id = str(getattr(session, "node_id", "") or "") if self.controller.connected and session else ""
+        from ... import zapret_strategies as strategies
+        rows = []
+        for node_id, preset in presets.items():
+            node = self.controller._get_node_by_id(node_id)
+            strategy_mode = strategies.is_server_strategy(preset)
+            effective = "" if strategy_mode else (preset or str(settings.zapret_preset or ""))
+            choices = self._zapret_binding_choices(node, preset) if node is not None else []
+            value = self._zapret_binding_value(node, preset) if node is not None else ""
+            values = [choice["value"] for choice in choices]
+            kind = strategies.node_server_kind(node) if strategy_mode and node is not None else ""
+            rows.append({
+                "nodeId": node_id,
+                "name": self._node_option_label(node) if node is not None else tr("Сервер удалён"),
+                "preset": preset,
+                "missingNode": node is None,
+                "missingPreset": bool(effective) and effective not in known,
+                "active": bool(connected_id) and connected_id == node_id,
+                "strategyMode": strategy_mode,
+                "kindTitle": strategies.KIND_TITLES.get(kind, kind),
+                "choices": choices,
+                "choiceIndex": values.index(value) if value in values else -1,
+                # Old bindings to "the preset started by hand" have no entry in the picker.
+                "placeholder": f"{tr('Пресет')}: {effective}" if not preset and effective else "",
+            })
+        rows.sort(key=lambda row: (row["missingNode"], str(row["name"]).lower()))
+        return rows
+
+    def _zapret_strategy_options(self, kind: str) -> tuple[list[dict], list[str]]:
+        """Catalog of a server kind for the picker: default strategy first, then by reliability."""
+        from ... import zapret_strategies as strategies
+        catalog = strategies.kind_catalog(kind)
+        cache = self.__dict__.setdefault("_zapret_strategy_cache", {})
+        cached = cache.get(kind)
+        if cached is not None and cached[0] is catalog:
+            return cached[1], cached[2]
+        default = strategies.DEFAULT_STRATEGIES.get(kind, "")
+        entries = sorted(
+            catalog.values(),
+            key=lambda entry: (entry.strategy_id != default, strategies.strategy_sort_key(entry)),
+        )
+        options = [{"value": entry.strategy_id, "label": entry.name} for entry in entries]
+        ids = [entry.strategy_id for entry in entries]
+        cache[kind] = (catalog, options, ids)
+        return options, ids
+
+    def _zapret_binding_value(self, node, preset: str) -> str:
+        """Picker value of a binding: "@server" for the automatic strategy of the server kind."""
+        from ... import zapret_strategies as strategies
+        if not strategies.is_server_strategy(preset):
+            return preset
+        kind = strategies.node_server_kind(node)
+        current = strategies.strategy_for(kind, strategies.server_strategy_id(preset))
+        if current is None or current.strategy_id == strategies.DEFAULT_STRATEGIES.get(kind):
+            return strategies.SERVER_STRATEGY_PRESET
+        return strategies.server_strategy_preset(current.strategy_id)
+
+    def _zapret_binding_choices(self, node, preset: str = "") -> list[dict]:
+        """One picker per server: automatic strategy, presets, then the other strategies of its kind."""
+        from ... import zapret_strategies as strategies
+        kind = strategies.node_server_kind(node)
+        choices: list[dict] = []
+        auto = strategies.strategy_for(kind)
+        if auto is not None:
+            choices.append({"value": strategies.SERVER_STRATEGY_PRESET, "label": f"{tr('Авто')}: {auto.name}"})
+        names = [str(info.get("name")) for info in self.zapretPresets() if isinstance(info, dict) and info.get("name")]
+        if preset and not strategies.is_server_strategy(preset) and preset not in names:
+            names.append(preset)  # a vanished preset stays visible (marked "not found")
+        choices.extend({"value": name, "label": f"{tr('Пресет')}: {name}"} for name in names)
+        default = auto.strategy_id if auto is not None else ""
+        options, _ids = self._zapret_strategy_options(kind)
+        choices.extend(
+            {"value": strategies.server_strategy_preset(option["value"]), "label": option["label"]}
+            for option in options
+            if option["value"] != default
+        )
+        return choices
+
+    @pyqtSlot(str, result="QVariantList")
+    def zapretBindingChoices(self, node_id: str):
+        node = self.controller._get_node_by_id(str(node_id or "").strip()) if node_id else None
+        return self._zapret_binding_choices(node) if node is not None else []
+
+    @pyqtSlot(result="QVariantList")
+    def zapretServerOptions(self):
+        bound = set((getattr(self.controller.state.settings, "zapret_server_presets", None) or {}).keys())
+        selected = self.controller.selected_node
+        selected_id = str(getattr(selected, "id", "") or "")
+        options = []
+        for node in self.controller.state.nodes:
+            if node.id in bound:
+                continue
+            item = {"value": node.id, "label": self._node_option_label(node)}
+            if node.id == selected_id:
+                # The selected server is the one most likely to be bound: always first.
+                item["label"] = f"{item['label']} ({tr('Текущий')})"
+                options.insert(0, item)
+            else:
+                options.append(item)
+        return options
+
+    def _store_zapret_bindings(self, presets: dict[str, str]) -> None:
+        settings = deepcopy(self.controller.state.settings)
+        settings.zapret_server_presets = presets
+        self.controller.update_settings(settings)
+        self.zapretBindingsChanged.emit()
+        QTimer.singleShot(0, self.controller.sync_zapret_server_binding)
+
+    @pyqtSlot(str, str)
+    def setZapretServerBinding(self, node_id: str, preset: str) -> None:
+        from ... import zapret_strategies as strategies
+        key = str(node_id or "").strip()
+        if not key or self.controller._get_node_by_id(key) is None:
+            return
+        presets = dict(getattr(self.controller.state.settings, "zapret_server_presets", None) or {})
+        value = str(preset or "").strip()
+        if strategies.is_server_strategy(value):
+            kind = strategies.node_server_kind(self.controller._get_node_by_id(key))
+            sid = strategies.server_strategy_id(value)
+            if sid and sid not in strategies.kind_catalog(kind):
+                return
+            value = strategies.server_strategy_preset("" if sid == strategies.DEFAULT_STRATEGIES.get(kind) else sid)
+        if presets.get(key) == value:
+            return
+        presets[key] = value
+        self._store_zapret_bindings(presets)
+
+    @pyqtSlot(str)
+    def removeZapretServerBinding(self, node_id: str) -> None:
+        presets = dict(getattr(self.controller.state.settings, "zapret_server_presets", None) or {})
+        if presets.pop(str(node_id or ""), None) is None:
+            return
+        self._store_zapret_bindings(presets)
+
+    # ── Proxy chain (front proxy -> server -> exit proxy) ──────────────
+    @pyqtProperty(bool, notify=settingsChanged)
+    def proxyChainEnabled(self) -> bool:
+        return bool(getattr(self.controller.state.settings, "proxy_chain_enabled", False))
+
+    @pyqtProperty(str, notify=settingsChanged)
+    def proxyChainFrontId(self) -> str:
+        return str(getattr(self.controller.state.settings, "proxy_chain_front_node_id", "") or "")
+
+    @pyqtProperty(str, notify=settingsChanged)
+    def proxyChainExitId(self) -> str:
+        return str(getattr(self.controller.state.settings, "proxy_chain_exit_node_id", "") or "")
+
+    def _update_proxy_chain(self, **changes: Any) -> None:
+        settings = deepcopy(self.controller.state.settings)
+        for key, value in changes.items():
+            setattr(settings, key, value)
+        self.controller.update_settings(settings)
+
+    @pyqtSlot(bool)
+    def setProxyChainEnabled(self, enabled: bool) -> None:
+        self._update_proxy_chain(proxy_chain_enabled=bool(enabled))
+
+    @pyqtSlot(str)
+    def setProxyChainFront(self, node_id: str) -> None:
+        self._update_proxy_chain(proxy_chain_front_node_id=str(node_id or "").strip())
+
+    @pyqtSlot(str)
+    def setProxyChainExit(self, node_id: str) -> None:
+        self._update_proxy_chain(proxy_chain_exit_node_id=str(node_id or "").strip())
+
+    @pyqtSlot(result="QVariantList")
+    def proxyChainNodeOptions(self):
+        from ...proxy_chain import is_full_config_node
+        options = [{"value": "", "label": tr("Не использовать")}]
+        options.extend(
+            {"value": node.id, "label": self._node_option_label(node)}
+            for node in self.controller.state.nodes
+            if not is_full_config_node(node)
+        )
+        settings = self.controller.state.settings
+        for stale in (settings.proxy_chain_front_node_id, settings.proxy_chain_exit_node_id):
+            if stale and all(option["value"] != stale for option in options):
+                options.append({"value": stale, "label": tr("Сервер удалён")})
+        return options
+
+    @pyqtSlot(result="QVariantMap")
+    def proxyChainPreview(self):
+        """Hops for the currently selected server as shown in Settings."""
+        from ...proxy_chain import ProxyChain, resolve_proxy_chain
+        settings = deepcopy(self.controller.state.settings)
+        settings.proxy_chain_enabled = True
+        main = self.controller.selected_node
+        chain = resolve_proxy_chain(settings, self.controller.state.nodes, main) or ProxyChain()
+        hops = []
+        if chain.front is not None:
+            hops.append({"role": "front", "label": self._node_option_label(chain.front)})
+        hops.append({
+            "role": "main",
+            "label": self._node_option_label(main) if main is not None else tr("Выбранный сервер"),
+        })
+        if chain.exit is not None:
+            hops.append({"role": "exit", "label": self._node_option_label(chain.exit)})
+        return {"hops": hops, "notes": [self._localized_backend_message(note) for note in chain.notes]}
+
     def _on_zapret_started(self) -> None:
         try:
-            active = self.controller.state.settings.zapret_preset or ""
+            running = self._zapret_manual_running()
+            active = self._zapret_active_preset() if running else ""
         except Exception:
-            active = ""
-        self.zapretState.emit({"running": True, "preset": active, "error": ""})
+            running, active = True, ""
+        self.zapretState.emit({"running": running, "preset": active, "serverPreset": self._zapret_server_preset(), "error": ""})
 
     def _on_zapret_stopped(self) -> None:
         self.zapretState.emit({"running": False, "preset": "", "error": ""})
@@ -4208,6 +4618,73 @@ class AppBridge(QObject):
     @pyqtProperty(bool, notify=regionalPresetBusyChanged)
     def regionalPresetBusy(self) -> bool:
         return bool(self._pending_regional_preset)
+
+    @pyqtProperty(bool, notify=onboardingChanged)
+    def onboardingRequired(self) -> bool:
+        """Show the welcome flow: setup is pending or Lumen was upgraded."""
+        try:
+            if not getattr(self.controller, "profile_loaded", True):
+                return False
+            return AppBridge.onboardingSetupRequired.fget(self) or AppBridge.onboardingShowWhatsNew.fget(self)
+        except Exception:
+            return False
+
+    @pyqtProperty(bool, notify=onboardingChanged)
+    def onboardingSetupRequired(self) -> bool:
+        """The setup steps (language, look, region, configs) are still pending."""
+        try:
+            seen = int(getattr(self.controller.state.settings, "onboarding_revision", 0) or 0)
+            return seen < ONBOARDING_REVISION
+        except Exception:
+            return False
+
+    @pyqtProperty(bool, notify=onboardingChanged)
+    def onboardingShowWhatsNew(self) -> bool:
+        """Lumen was updated since the flow was last closed (never on fresh installs)."""
+        try:
+            seen = str(getattr(self.controller.state.settings, "onboarding_version", "") or "")
+            return is_upgrade(seen, APP_VERSION)
+        except Exception:
+            return False
+
+    @pyqtProperty("QVariantList", notify=onboardingChanged)
+    def onboardingWhatsNew(self) -> list:
+        """Release groups ``[{version, items: [{glyph, title, text}]}]``; QML translates the texts."""
+        try:
+            seen = str(getattr(self.controller.state.settings, "onboarding_version", "") or "")
+        except Exception:
+            seen = ""
+        return notes_between(seen, APP_VERSION)
+
+    @pyqtProperty(str, notify=onboardingChanged)
+    def onboardingPreviousVersion(self) -> str:
+        try:
+            seen = str(getattr(self.controller.state.settings, "onboarding_version", "") or "")
+        except Exception:
+            return ""
+        return "" if seen in {"", LEGACY_PROFILE_VERSION} else seen
+
+    @pyqtProperty(bool, notify=onboardingChanged)
+    def onboardingReturningUser(self) -> bool:
+        """True for upgrades and existing profiles, false on a fresh install."""
+        try:
+            state = self.controller.state
+            if str(getattr(state.settings, "onboarding_version", "") or ""):
+                return True
+            return bool(state.nodes or state.subscriptions)
+        except Exception:
+            return False
+
+    @pyqtProperty(int, notify=onboardingChanged)
+    def onboardingServerCount(self) -> int:
+        try:
+            return len(self.controller.state.nodes)
+        except Exception:
+            return 0
+
+    @pyqtProperty(str, constant=True)
+    def recommendedVpnUrl(self) -> str:
+        return RECOMMENDED_VPN_URL
 
     @pyqtProperty(bool, notify=settingsChanged)
     def preferIpv6(self) -> bool:
@@ -5108,25 +5585,59 @@ class AppBridge(QObject):
         except Exception:
             return []
 
+    def _normalized_domain_input(self, text: str) -> tuple[list[str], list[str], bool, bool]:
+        """(values, invalid, changed, internal) for the "add domain" field."""
+        values: list[str] = []
+        invalid: list[str] = []
+        changed = False
+        internal = False
+        for item in split_routing_addresses(text):
+            value = normalize_routing_address(item)
+            if value is None:
+                invalid.append(item)
+                continue
+            if self._is_internal_domain_rule(value):
+                internal = True
+                continue
+            changed = changed or value != item
+            if value not in values:
+                values.append(value)
+        return values, invalid, changed, internal
+
+    @pyqtSlot(str, result=str)
+    def countryFlagSource(self, code: str) -> str:
+        return get_flag_svg_data_uri(code)
+
+    @pyqtSlot(str, result="QVariantMap")
+    def normalizeDomainRuleInput(self, text: str):
+        values, invalid, changed, internal = self._normalized_domain_input(text)
+        return {"values": values, "invalid": invalid, "changed": bool(changed or internal)}
+
     @pyqtSlot(str, str)
     def addDomainRule(self, addr: str, action: str) -> None:
-        addr = (addr or "").strip()
-        if not addr:
+        values, invalid, changed, internal = self._normalized_domain_input(addr)
+        if not values:
+            if invalid:
+                self.toast.emit("warning", tr("Не похоже на домен, IP или CIDR: {value}", value=invalid[0]))
+            elif internal:
+                self.toast.emit("warning", tr("Добавляйте конкретный домен, IP или CIDR"))
             return
-        if self._is_internal_domain_rule(addr):
-            self.toast.emit("warning", tr("Добавляйте конкретный домен, IP или CIDR"))
-            return
+
         def apply(r: RoutingSettings) -> None:
-            r.direct_domains = [d for d in r.direct_domains if d != addr]
-            r.proxy_domains = [d for d in r.proxy_domains if d != addr]
-            r.block_domains = [d for d in r.block_domains if d != addr]
-            if action == "direct":
-                r.direct_domains = list(r.direct_domains) + [addr]
-            elif action == "block":
-                r.block_domains = list(r.block_domains) + [addr]
-            else:
-                r.proxy_domains = list(r.proxy_domains) + [addr]
+            direct = [d for d in r.direct_domains if d not in values]
+            proxy = [d for d in r.proxy_domains if d not in values]
+            block = [d for d in r.block_domains if d not in values]
+            target = direct if action == "direct" else block if action == "block" else proxy
+            target.extend(values)
+            r.direct_domains = direct
+            r.proxy_domains = proxy
+            r.block_domains = block
         self._mutate_routing(apply)
+        if invalid:
+            self.toast.emit("warning", tr("Пропущено некорректных адресов: {count}", count=len(invalid)))
+        elif changed:
+            shown = ", ".join(values[:3]) + (" …" if len(values) > 3 else "")
+            self.toast.emit("info", tr("Добавлено: {value}", value=shown))
 
     @pyqtSlot(str)
     def removeDomainRule(self, addr: str) -> None:
@@ -5146,6 +5657,10 @@ class AppBridge(QObject):
         if not accepted_lines:
             self.toast.emit("warning", "Нет строк для импорта")
             return
+        accepted_lines = [
+            (normalize_routing_address(addr) or addr, action)
+            for addr, action in accepted_lines
+        ]
         accepted_lines = [
             (addr, action)
             for addr, action in accepted_lines

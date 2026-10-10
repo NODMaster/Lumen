@@ -17,6 +17,7 @@ from .node_service import (
     fetch_subscription_payload,
     get_all_groups,
     import_nodes_from_text,
+    import_parsed_nodes,
     import_subscription,
     remove_nodes,
     remove_subscription,

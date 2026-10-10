@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from ..constants import DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT
 from ..engines.singbox import classify_node_for_singbox
+from ..proxy_chain import proxy_chain_signature
 from .node_runtime_service import proxy_core_for_node
 
 if TYPE_CHECKING:
@@ -83,6 +84,7 @@ def transition_signature(
                 "regional_preset": str(getattr(settings, "regional_preset", "russia")),
                 "discord_proxy_enabled": bool(settings.discord_proxy_enabled),
                 "prefer_ipv6": bool(getattr(settings, "prefer_ipv6", False)),
+                "proxy_chain": proxy_chain_signature(settings, getattr(getattr(controller, "state", None), "nodes", ())),
             }
         )
     if controller.is_singbox_editor_mode(settings):
@@ -103,6 +105,7 @@ def transition_signature(
             "regional_preset": str(getattr(settings, "regional_preset", "russia")),
             "discord_proxy_enabled": bool(settings.discord_proxy_enabled),
             "prefer_ipv6": bool(getattr(settings, "prefer_ipv6", False)),
+            "proxy_chain": proxy_chain_signature(settings, getattr(getattr(controller, "state", None), "nodes", ())),
             "tun_runtime": _singbox_tun_runtime_signature(settings),
         }
         if planner_outcome == "hybrid_xray_sidecar":
@@ -125,6 +128,7 @@ def transition_signature(
             "regional_preset": str(getattr(settings, "regional_preset", "russia")),
             "discord_proxy_enabled": bool(settings.discord_proxy_enabled),
             "prefer_ipv6": bool(getattr(settings, "prefer_ipv6", False)),
+            "proxy_chain": proxy_chain_signature(settings, getattr(getattr(controller, "state", None), "nodes", ())),
         }
         signature_payload.update(
             {
@@ -160,6 +164,7 @@ def transition_signature(
             "regional_preset": str(getattr(settings, "regional_preset", "russia")),
             "discord_proxy_enabled": bool(settings.discord_proxy_enabled),
             "prefer_ipv6": bool(getattr(settings, "prefer_ipv6", False)),
+            "proxy_chain": proxy_chain_signature(settings, getattr(getattr(controller, "state", None), "nodes", ())),
         }
     )
 
@@ -193,6 +198,7 @@ def xray_layer_signature(
             "routing": routing.to_dict(),
             "discord_proxy_enabled": bool(settings.discord_proxy_enabled),
             "prefer_ipv6": bool(getattr(settings, "prefer_ipv6", False)),
+            "proxy_chain": proxy_chain_signature(settings, getattr(getattr(controller, "state", None), "nodes", ())),
         }
         return signature(signature_payload)
     return signature(
@@ -205,6 +211,7 @@ def xray_layer_signature(
             "routing": routing.to_dict(),
             "discord_proxy_enabled": bool(settings.discord_proxy_enabled),
             "prefer_ipv6": bool(getattr(settings, "prefer_ipv6", False)),
+            "proxy_chain": proxy_chain_signature(settings, getattr(getattr(controller, "state", None), "nodes", ())),
         }
     )
 
@@ -235,5 +242,6 @@ def tun_layer_signature(
             "singbox_path": str(settings.singbox_path),
             "discord_proxy_enabled": bool(settings.discord_proxy_enabled),
             "prefer_ipv6": bool(getattr(settings, "prefer_ipv6", False)),
+            "proxy_chain": proxy_chain_signature(settings, getattr(getattr(controller, "state", None), "nodes", ())),
         }
     )

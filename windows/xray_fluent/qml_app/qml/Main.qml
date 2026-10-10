@@ -243,7 +243,18 @@ ApplicationWindow {
         }
     }
 
+    // Welcome flow hand-off: the regular UI settles in (slight scale + fade)
+    // while the onboarding card dissolves, so the dashboard "arrives".
+    // Render-thread Animators: smooth at the monitor's refresh rate even while
+    // the GUI thread is busy right after the welcome flow closes.
+    ParallelAnimation {
+        id: chromeSettleAnim
+        OpacityAnimator { target: appChrome; from: 0.35; to: 1; duration: Theme.animations ? 900 : 0; easing.type: Easing.OutQuint }
+        ScaleAnimator { target: appChrome; from: 0.975; to: 1; duration: Theme.animations ? 900 : 0; easing.type: Easing.OutQuint }
+    }
+
     Item {
+        id: appChrome
         anchors.fill: parent
         anchors.topMargin: titleBar.height
 
@@ -462,6 +473,15 @@ ApplicationWindow {
         anchors.right: parent.right
 
         z: 50
+    }
+
+    OnboardingOverlay {
+        id: onboarding
+        blurSource: appChrome
+        onClosingStarted: {
+            win.currentIndex = 0
+            chromeSettleAnim.restart()
+        }
     }
 
     ToastHost {}

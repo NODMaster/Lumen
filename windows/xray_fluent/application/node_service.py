@@ -223,6 +223,27 @@ def import_nodes_from_text(
     # so it is the only one that enables file references; every subscription path
     # below parses remote, untrusted bodies and must keep the secure default.
     nodes, errors = parse_links_text(text, allow_file_reference=True)
+    return import_parsed_nodes(
+        controller,
+        nodes,
+        errors,
+        group=group,
+        auto_connect=auto_connect,
+        select_imported=select_imported,
+    )
+
+
+def import_parsed_nodes(
+    controller: AppController,
+    nodes: list[Node],
+    errors: list[str] | None = None,
+    *,
+    group: str | None = None,
+    auto_connect: bool | None = None,
+    select_imported: bool = False,
+) -> tuple[int, list[str]]:
+    """Add already-parsed nodes (generated profiles, parsed imports)."""
+    errors = list(errors or [])
     if not nodes:
         return 0, errors
 

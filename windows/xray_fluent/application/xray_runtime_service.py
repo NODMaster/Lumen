@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..constants import DEFAULT_DISCORD_SOCKS_PORT, PROXY_HOST
 from ..multiplex import apply_xray_multiplex
+from ..proxy_chain import apply_xray_proxy_chain
 from ..routing_runtime import apply_xray_gui_routing
 from ..xray_inbounds import ensure_xray_mixed_proxy_inbound
 from ..xray_fragments import apply_xray_final_fragment, apply_xray_outbound_fragment
@@ -317,6 +318,14 @@ def build_runtime_xray_config(controller: AppController, node: Node | None = Non
             outbounds[index] = proxy_outbound
             used_selected_node = True
             break
+        resolve_chain = getattr(controller, "_resolve_proxy_chain", None)
+        chain = resolve_chain(node) if used_selected_node and callable(resolve_chain) else None
+        if chain is not None:
+            applied = apply_xray_proxy_chain(outbounds, chain)
+            for note in chain.notes:
+                controller._log(f"[chain] {note}")
+            if applied:
+                controller._log(f"[chain] xray: {chain.describe(node)}")
 
     # A full AUTO profile owns its routing/observatory contract. Replacing the
     # rules here would silently remove balancerTag=auto and disable leastPing.

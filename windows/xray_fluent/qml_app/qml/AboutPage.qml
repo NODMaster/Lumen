@@ -74,13 +74,19 @@ FluentScroll {
                 kind: "ghost"
                 glyph: "\uE734"  // Shield
                 text: I18n.t("Рекомендуемый VPN")
-                onClicked: App.openUrl("https://t.me/zapretvpns_bot")
+                onClicked: App.openUrl(App.recommendedVpnUrl)
             }
             AccentButton {
                 kind: "ghost"
                 glyph: "\uE8F1"
                 text: I18n.t("Поддержать проект")
                 onClicked: supportDialog.open()
+            }
+            AccentButton {
+                kind: "ghost"
+                glyph: "\uE80F"
+                text: I18n.t("Показать приветствие")
+                onClicked: App.showOnboardingAgain()
             }
             Item { Layout.fillWidth: true }
         }

@@ -570,6 +570,20 @@ Item {
                 color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSmall; wrapMode: Text.WordWrap; Layout.fillWidth: true
             }
             DnsField { id: domainInput; placeholderText: "example.com" }
+            Text {
+                id: domainPreview
+                // Live preview of what will actually be added (URL -> host, etc.).
+                readonly property var info: domainInput.text.trim().length
+                                            ? App.normalizeDomainRuleInput(domainInput.text)
+                                            : ({ values: [], invalid: [], changed: false })
+                visible: domainInput.text.trim().length > 0 && (info.changed || info.invalid.length > 0)
+                text: info.values.length
+                      ? I18n.t("Будет добавлено: {value}", { value: info.values.join(", ") })
+                      : I18n.t("Не похоже на домен, IP или CIDR")
+                color: info.values.length ? Theme.textMuted : Theme.danger
+                font.family: Theme.fontFamily; font.pixelSize: Theme.fontSmall
+                wrapMode: Text.WrapAnywhere; Layout.fillWidth: true
+            }
             RowLayout {
                 Layout.fillWidth: true; spacing: 10
                 Text { text: I18n.t("Действие"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: Theme.fontSmall }

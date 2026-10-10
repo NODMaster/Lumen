@@ -108,22 +108,44 @@ def find_lumen_deep_link(arguments: list[str] | tuple[str, ...]) -> str:
 
 def encode_instance_message(arguments: list[str] | tuple[str, ...]) -> bytes:
     link = find_lumen_deep_link(arguments)
-    payload = {"command": "deeplink" if link else "activate"}
     if link:
-        payload["url"] = link
+        payload = {"command": "deeplink", "url": link}
+    else:
+        args = list(arguments)
+        flags = set(str(a or "").strip() for a in (args[1:] if len(args) > 1 else args))
+        is_tray = "--tray" in flags and not bool(flags & {"--relaunched", "--relaunch-as-admin"})
+        payload = {"command": "tray" if is_tray else "activate"}
     return (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def decode_instance_message(payload: bytes) -> str:
-    """Return the deep link from IPC, or an empty string for activation-only."""
+def parse_instance_message(payload: bytes) -> tuple[str, str]:
+    """Parse local IPC payload into (command, url).
+
+    Returns ('activate', '') for standard activation or legacy payload,
+    ('tray', '') for secondary autostart notifications that must stay in tray,
+    ('deeplink', url) for deep links.
+    """
     raw = bytes(payload or b"")[: MAX_DEEP_LINK_LENGTH + 1024].strip()
     if not raw or raw == b"activate":
-        return ""
+        return ("activate", "")
     try:
         message = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return ""
-    if not isinstance(message, dict) or message.get("command") != "deeplink":
-        return ""
-    link = str(message.get("url") or "").strip()
-    return link if link.lower().startswith("lumen:") and len(link) <= MAX_DEEP_LINK_LENGTH else ""
+        return ("activate", "")
+    if not isinstance(message, dict):
+        return ("activate", "")
+    command = str(message.get("command") or "").strip().lower()
+    if command == "deeplink":
+        link = str(message.get("url") or "").strip()
+        if link.lower().startswith("lumen:") and len(link) <= MAX_DEEP_LINK_LENGTH:
+            return ("deeplink", link)
+        return ("activate", "")
+    if command == "tray":
+        return ("tray", "")
+    return ("activate", "")
+
+
+def decode_instance_message(payload: bytes) -> str:
+    """Return the deep link from IPC, or an empty string for activation/tray-only."""
+    command, link = parse_instance_message(payload)
+    return link if command == "deeplink" else ""

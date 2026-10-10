@@ -4,6 +4,10 @@ import QtQuick.Layouts
 import App 1.0
 import "."
 
+// Raw sing-box / xray config editor.
+//   header  : title + core switch
+//   source  : active config file and template (with import/reset)
+//   editor  : file toolbar, code editor with line numbers, status bar
 Item {
     id: page
 
@@ -23,11 +27,19 @@ Item {
     property string statusMessage: ""
     property string savedText: ""
     readonly property bool dirty: editor.text !== page.savedText
+    readonly property int errorLine: _errorLine(page.statusLevel, page.statusMessage)
 
     property var _pendingAction: null
 
-    // ---- reusable styled controls (Windows 11 Fluent look) --------------
     component StyledCombo: FluentCombo {}
+
+    component FieldLabel: Text {
+        color: Theme.textMuted
+        font.family: Theme.fontFamily
+        font.pixelSize: Theme.fontNormal
+        Layout.preferredWidth: 72
+        elide: Text.ElideRight
+    }
 
     function _indexOfValue(items, value) {
         for (var i = 0; i < items.length; i++)
@@ -43,11 +55,26 @@ Item {
         return out
     }
 
-    function _statusPrefix(level) {
-        return level === "success" ? "OK"
-             : level === "warning" ? I18n.t("Внимание")
-             : level === "error" ? I18n.t("Ошибка")
-             : level === "info" ? I18n.t("Инфо") : ""
+    function _levelColor(level) {
+        return level === "success" ? Theme.success
+             : level === "warning" ? Theme.warning
+             : level === "error" ? Theme.danger
+             : Theme.textMuted
+    }
+
+    function _levelGlyph(level) {
+        return level === "success" ? "\uE73E"
+             : level === "warning" ? "\uE7BA"
+             : level === "error" ? "\uEA39"
+             : "\uE946"
+    }
+
+    // JSON errors from the bridge mention the line: "строка 12" / "line 12".
+    function _errorLine(level, message) {
+        if (level !== "error" || !message)
+            return 0
+        var m = /(?:строк[аеи]|line)\s*:?\s*(\d+)/i.exec(message)
+        return m ? parseInt(m[1]) : 0
     }
 
     function _syncCombos() {
@@ -176,11 +203,30 @@ Item {
             return
         _guard(function() { _ingest(App.resetConfig(page.core)) })
     }
+    function doRevert() {
+        editor.text = page.savedText
+    }
     function doSave() {
         _ingest(App.saveConfig(page.core, editor.text, page.savedText))
     }
     function doValidate() {
         _ingestStatus(App.validateConfig(page.core, editor.text))
+    }
+    function doFormat() {
+        var parsed
+        try {
+            parsed = JSON.parse(editor.text)
+        } catch (e) {
+            // Let the bridge report the exact position of the error.
+            doValidate()
+            return
+        }
+        var formatted = JSON.stringify(parsed, null, 2)
+        if (formatted !== editor.text) {
+            editor.text = formatted
+            page.statusLevel = "info"
+            page.statusMessage = I18n.t("JSON отформатирован — не забудьте сохранить")
+        }
     }
     function doApply() {
         var st = App.applyConfig(page.core, editor.text, page.savedText)
@@ -191,169 +237,240 @@ Item {
 
     Component.onCompleted: if (!page.loaded) loadCore(page.core)
 
+    Shortcut {
+        sequences: [StandardKey.Save]
+        enabled: page.visible && page.loaded && !confirmOverlay.visible
+        onActivated: page.doSave()
+    }
+
     ColumnLayout {
         anchors.fill: parent
-        spacing: Theme.spacingLarge
+        spacing: Theme.spacing
 
-        Text {
-            text: I18n.t("Конфиги")
-            color: Theme.text; font.family: Theme.fontFamily
-            font.pixelSize: Theme.fontTitle; font.weight: Font.DemiBold
-        }
-
-        // ---- segmented core selector (sing-box / xray) ----
-        Row {
-            spacing: 0
-            Layout.preferredHeight: 34
-            Repeater {
-                model: [{ key: "singbox", label: "sing-box" }, { key: "xray", label: "xray" }]
-                delegate: Rectangle {
-                    width: 120; height: 34
-                    readonly property bool active: page.core === modelData.key
-                    radius: Theme.radiusSmall
-                    color: "transparent"
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: parent.radius
-                        color: active ? Theme.accentSoft : Theme.navHover
-                        opacity: active || coreTabMouse.containsMouse ? 1 : 0
-                        Behavior on opacity { NumberAnimation { duration: Theme.animations ? 140 : 0 } }
-                    }
-                    Text {
-                        anchors.centerIn: parent
-                        text: modelData.label
-                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontNormal
-                        font.weight: active ? Font.DemiBold : Font.Normal
-                        color: active ? Theme.text : Theme.textMuted
-                    }
-                    // Fluent SegmentedWidget underline indicator
-                    Rectangle {
-                        anchors.bottom: parent.bottom
-                        anchors.horizontalCenter: parent.horizontalCenter
-                        width: active ? 24 : 0
-                        height: 3; radius: 1.5
-                        color: Theme.accent
-                        Behavior on width { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
-                    }
-                    MouseArea {
-                        id: coreTabMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        onClicked: page.switchCore(modelData.key)
+        // ---- header: title + core switch ----
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 12
+            Text {
+                text: I18n.t("Конфиги")
+                color: Theme.text; font.family: Theme.fontFamily
+                font.pixelSize: Theme.fontTitle; font.weight: Font.DemiBold
+            }
+            Item { Layout.fillWidth: true }
+            Rectangle {
+                implicitWidth: coreRow.implicitWidth + 6
+                implicitHeight: 34
+                radius: Theme.radiusSmall
+                color: Theme.controlFill
+                border.width: 1; border.color: Theme.borderSolid
+                Row {
+                    id: coreRow
+                    anchors.centerIn: parent
+                    spacing: 2
+                    Repeater {
+                        model: [{ key: "singbox", label: "sing-box" }, { key: "xray", label: "Xray" }]
+                        delegate: Rectangle {
+                            width: 104; height: 28
+                            readonly property bool active: page.core === modelData.key
+                            radius: Theme.radiusSmall - 1
+                            color: active ? Theme.card : (coreTabMouse.containsMouse ? Theme.navHover : "transparent")
+                            border.width: active ? 1 : 0
+                            border.color: Theme.borderSolid
+                            Behavior on color { ColorAnimation { duration: Theme.animations ? 120 : 0 } }
+                            Text {
+                                anchors.centerIn: parent
+                                text: modelData.label
+                                font.family: Theme.fontFamily; font.pixelSize: Theme.fontNormal
+                                font.weight: parent.active ? Font.DemiBold : Font.Normal
+                                color: parent.active ? Theme.text : Theme.textMuted
+                            }
+                            MouseArea {
+                                id: coreTabMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: page.switchCore(modelData.key)
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // ---- selectors row ----
-        RowLayout {
+        // ---- source: config file + template ----
+        Card {
             Layout.fillWidth: true
-            spacing: 8
-            Text { text: I18n.t("Конфиг"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontNormal }
-            StyledCombo {
-                id: configCombo
-                enabled: page.configItems.length > 0
-                Layout.fillWidth: true; Layout.preferredWidth: 280
-                model: page.configItems.length > 0 ? page._labels(page.configItems) : [I18n.t("Нет конфигов")]
-                onActivated: page.doSelectConfig(configCombo.currentIndex)
-            }
-            Item { Layout.preferredWidth: 12 }
-            Text { text: I18n.t("Шаблон"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: Theme.fontNormal }
-            StyledCombo {
-                id: templateCombo
-                enabled: page.templateItems.length > 0
-                Layout.fillWidth: true; Layout.preferredWidth: 280
-                model: page.templateItems.length > 0 ? page._labels(page.templateItems) : [I18n.t("Шаблон не выбран")]
-                onActivated: page.doSelectTemplate(templateCombo.currentIndex)
-            }
-            AccentButton {
-                kind: "ghost"
-                glyph: "\uE838"
-                iconOnly: true
-                tip: I18n.t("Открыть папку конфигов")
-                onClicked: App.openConfigDirectory(page.core)
-            }
-        }
+            padding: 14
+            hoverable: false
+            GridLayout {
+                width: parent.width
+                columns: 3
+                columnSpacing: 10
+                rowSpacing: 10
 
-        // ---- toolbar ----
-        RowLayout {
-            Layout.fillWidth: true
-            spacing: 8
-            AccentButton { kind: "ghost"; text: I18n.t("Импорт шаблона"); enabled: page.loaded; onClicked: page.doImportTemplate() }
-            AccentButton { kind: "ghost"; text: I18n.t("Сбросить к шаблону"); enabled: page.loaded && page.hasTemplate; onClicked: page.doReset() }
-            AccentButton { kind: "ghost"; text: I18n.t("Сохранить"); enabled: page.loaded; onClicked: page.doSave() }
-            AccentButton { kind: "ghost"; text: I18n.t("Проверить JSON"); enabled: page.loaded; onClicked: page.doValidate() }
-            Item { Layout.fillWidth: true }
-            AccentButton { kind: "accent"; text: I18n.t("Применить"); enabled: page.loaded; onClicked: page.doApply() }
+                FieldLabel { text: I18n.t("Конфиг") }
+                StyledCombo {
+                    id: configCombo
+                    enabled: page.configItems.length > 0
+                    Layout.fillWidth: true
+                    model: page.configItems.length > 0 ? page._labels(page.configItems) : [I18n.t("Нет конфигов")]
+                    onActivated: page.doSelectConfig(configCombo.currentIndex)
+                }
+                AccentButton {
+                    kind: "ghost"
+                    glyph: "\uE838"
+                    text: I18n.t("Папка")
+                    tip: I18n.t("Открыть папку конфигов")
+                    onClicked: App.openConfigDirectory(page.core)
+                }
+
+                FieldLabel { text: I18n.t("Шаблон") }
+                StyledCombo {
+                    id: templateCombo
+                    enabled: page.templateItems.length > 0
+                    Layout.fillWidth: true
+                    model: page.templateItems.length > 0 ? page._labels(page.templateItems) : [I18n.t("Шаблон не выбран")]
+                    onActivated: page.doSelectTemplate(templateCombo.currentIndex)
+                }
+                RowLayout {
+                    spacing: 6
+                    AccentButton {
+                        kind: "ghost"; glyph: "\uE8B5"
+                        text: I18n.t("Импорт")
+                        tip: I18n.t("Импорт шаблона")
+                        enabled: page.loaded
+                        onClicked: page.doImportTemplate()
+                    }
+                    AccentButton {
+                        kind: "ghost"; glyph: "\uE777"; iconOnly: true
+                        tip: I18n.t("Сбросить к шаблону")
+                        enabled: page.loaded && page.hasTemplate
+                        onClicked: page.doReset()
+                    }
+                }
+            }
         }
 
         // ---- editor ----
-        Rectangle {
+        Card {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            radius: Theme.radiusSmall
-            color: Theme.card
-            border.width: 1; border.color: Theme.borderSolid
-            Flickable {
-                id: editorFlick
+            padding: 0
+            hoverable: false
+            ColumnLayout {
                 anchors.fill: parent
-                anchors.margins: 1
-                clip: true
-                boundsBehavior: Flickable.StopAtBounds
-                flickDeceleration: 5000
-                maximumFlickVelocity: 3000
-                pixelAligned: true
-                // eased mouse-wheel scroll (matches FluentScroll feel)
-                property real wheelStep: 92
-                NumberAnimation {
-                    id: editorScrollAnim
-                    target: editorFlick; property: "contentY"
-                    duration: 320; easing.type: Easing.OutQuint
-                }
-                WheelHandler {
-                    acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
-                    onWheel: (ev) => {
-                        var maxY = Math.max(0, editorFlick.contentHeight - editorFlick.height)
-                        if (maxY <= 0) { ev.accepted = true; return }
-                        if (ev.pixelDelta.y !== 0) {
-                            editorScrollAnim.stop()
-                            editorFlick.contentY = Math.max(0, Math.min(maxY, editorFlick.contentY - ev.pixelDelta.y))
-                        } else {
-                            var base = editorScrollAnim.running ? editorScrollAnim.to : editorFlick.contentY
-                            var target = Math.max(0, Math.min(maxY, base - (ev.angleDelta.y / 120) * editorFlick.wheelStep))
-                            editorScrollAnim.to = target
-                            editorScrollAnim.restart()
+                spacing: 0
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.margins: 10
+                    spacing: 6
+                    Text {
+                        text: "\uE8A5"
+                        font.family: "Segoe Fluent Icons"; font.pixelSize: 16
+                        color: Theme.textMuted
+                    }
+                    Text {
+                        text: page.fileLabel
+                        color: Theme.text; font.family: Theme.fontFamily
+                        font.pixelSize: Theme.fontNormal; font.weight: Font.DemiBold
+                        elide: Text.ElideMiddle
+                        Layout.maximumWidth: 320
+                    }
+                    Rectangle {
+                        visible: page.dirty
+                        radius: 9; implicitHeight: 18
+                        implicitWidth: dirtyText.implicitWidth + 14
+                        color: Qt.rgba(Theme.warning.r, Theme.warning.g, Theme.warning.b, 0.16)
+                        Text {
+                            id: dirtyText
+                            anchors.centerIn: parent
+                            text: I18n.t("Изменено")
+                            color: Theme.warning
+                            font.family: Theme.fontFamily; font.pixelSize: Theme.fontSmall
                         }
-                        editorVbar.flash()
-                        ev.accepted = true
+                    }
+                    Item { Layout.fillWidth: true }
+                    AccentButton {
+                        kind: "ghost"; glyph: "\uE7A7"; iconOnly: true
+                        tip: I18n.t("Отменить несохранённые правки")
+                        enabled: page.loaded && page.dirty
+                        onClicked: page.doRevert()
+                    }
+                    AccentButton {
+                        kind: "ghost"; glyph: "\uE8E5"; iconOnly: true
+                        tip: I18n.t("Форматировать JSON")
+                        enabled: page.loaded && editor.text.length > 0
+                        onClicked: page.doFormat()
+                    }
+                    AccentButton {
+                        kind: "ghost"; glyph: "\uE73E"
+                        text: I18n.t("Проверить")
+                        enabled: page.loaded
+                        onClicked: page.doValidate()
+                    }
+                    AccentButton {
+                        kind: "ghost"; glyph: "\uE74E"
+                        text: I18n.t("Сохранить")
+                        tip: "Ctrl+S"
+                        enabled: page.loaded
+                        onClicked: page.doSave()
+                    }
+                    AccentButton {
+                        kind: "accent"; glyph: "\uE768"
+                        text: I18n.t("Применить")
+                        tip: I18n.t("Сохранить и перезапустить ядро с этим конфигом")
+                        enabled: page.loaded
+                        onClicked: page.doApply()
                     }
                 }
 
-                TextArea.flickable: FluentTextArea {
+                CodeEditor {
                     id: editor
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    Layout.leftMargin: 10
+                    Layout.rightMargin: 10
                     placeholderText: "Raw " + (page.core === "singbox" ? "sing-box" : "xray") + ".json"
-                    color: Theme.text
-                    font.family: "Consolas"
-                    font.pixelSize: 13
-                    wrapMode: TextArea.NoWrap
-                    background: null
-                    selectByMouse: true
                 }
 
-                ScrollBar.vertical: FluentScrollBar {
-                    id: editorVbar
-                    anchors.top: parent.top
-                    anchors.right: parent.right
-                    anchors.bottom: parent.bottom
-                }
-                ScrollBar.horizontal: FluentScrollBar {
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.bottom: parent.bottom
+                // ---- status bar ----
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 12
+                    Layout.rightMargin: 12
+                    Layout.topMargin: 8
+                    Layout.bottomMargin: 8
+                    spacing: 8
+                    Text {
+                        visible: page.statusMessage !== ""
+                        text: page._levelGlyph(page.statusLevel)
+                        font.family: "Segoe Fluent Icons"; font.pixelSize: 14
+                        color: page._levelColor(page.statusLevel)
+                    }
+                    Text {
+                        Layout.fillWidth: true
+                        text: page.statusMessage !== "" ? page.statusMessage
+                            : (page.dirty ? I18n.t("Есть несохранённые изменения") : "")
+                        color: page.statusMessage !== "" ? page._levelColor(page.statusLevel) : Theme.textMuted
+                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSmall
+                        elide: Text.ElideRight
+                        maximumLineCount: 1
+                    }
+                    AccentButton {
+                        visible: page.errorLine > 0
+                        kind: "ghost"
+                        text: I18n.t("К строке {line}", { line: page.errorLine })
+                        onClicked: editor.goToLine(page.errorLine)
+                    }
+                    Text {
+                        text: I18n.t("Строк: {count}", { count: editor.lineCount })
+                        color: Theme.textFaint
+                        font.family: Theme.fontFamily; font.pixelSize: Theme.fontSmall
+                    }
                 }
             }
         }
-
     }
 
     // ---- discard-confirmation modal overlay -----------------------------

@@ -18,6 +18,7 @@ if os.name == "nt":
 from PyQt6.QtCore import QObject, QProcess, QTimer, pyqtSignal
 
 from .constants import BASE_DIR, DATA_DIR
+from .zapret_server_scope import ZapretServerScope, build_scoped_args
 from .subprocess_utils import (
     CREATE_NO_WINDOW,
     decode_output,
@@ -103,6 +104,8 @@ class ZapretManager(QObject):
         super().__init__(parent)
         self._process: QProcess | None = None
         self._current_preset: str = ""
+        # Bound preset restricted to one server (runs next to the manual one).
+        self._server_scope: ZapretServerScope | None = None
         self._start_args: list[str] = []
         self._start_retry_count = 0
         self._current_at_config: Path | None = None
@@ -147,6 +150,16 @@ class ZapretManager(QObject):
     @property
     def running(self) -> bool:
         return self._process is not None and self._process.state() == QProcess.ProcessState.Running
+
+    @property
+    def current_preset(self) -> str:
+        """Name of the preset that is currently running ("" when stopped)."""
+        return self._current_preset if self._process is not None else ""
+
+    @property
+    def server_scope(self) -> ZapretServerScope | None:
+        """Server-only part of the running process (None when absent)."""
+        return self._server_scope if self._process is not None else None
 
     def _release_process(self, process: QProcess | None = None) -> None:
         if process is None:
@@ -410,6 +423,12 @@ class ZapretManager(QObject):
             return f"winws2.exe не найден: {exe}"
         if not preset.exists():
             return f"Пресет не найден: {preset}"
+        return self._preflight_exe(exe)
+
+    @staticmethod
+    def _preflight_exe(exe: Path) -> str:
+        if not exe.exists():
+            return f"winws2.exe не найден: {exe}"
         exe_dir = exe.parent
         required = ("WinDivert.dll", "Monkey64.sys")
         missing = [name for name in required if not (exe_dir / name).exists()]
@@ -461,22 +480,50 @@ class ZapretManager(QObject):
         self,
         preset_name: str,
         *,
+        server_scope: ZapretServerScope | None = None,
         _retry_count: int = 0,
         _force_cleanup: bool = False,
         _launch_mode: str = "direct",
     ) -> None:
         preset_name = (preset_name or "").strip()
         exe = WINWS2_EXE
+        scope = server_scope if server_scope is not None and server_scope.ips else None
         preset = self.preset_path(preset_name)
-        preflight_error = self._preflight_start(exe, preset, preset_name)
-        if preflight_error:
-            self.error.emit(preflight_error)
-            return
-
-        args = self._parse_preset_args(preset)
-        if not args:
-            self.error.emit(f"Пресет пустой: {preset_name}")
-            return
+        args: list[str] = []
+        if preset_name or scope is None:
+            preflight_error = self._preflight_start(exe, preset, preset_name)
+            if preflight_error:
+                self.error.emit(preflight_error)
+                return
+            args = self._parse_preset_args(preset)
+            if not args:
+                self.error.emit(f"Пресет пустой: {preset_name}")
+                return
+        if scope is not None:
+            if scope.uses_strategy:
+                server_preset = ZAPRET_DIR / "strategy_catalogs" / "winws2" / f"{scope.kind or 'tcp'}-server.txt"
+                preflight_error = self._preflight_exe(exe)
+            else:
+                server_preset = self.preset_path(scope.preset)
+                preflight_error = self._preflight_start(exe, server_preset, scope.preset)
+            if preflight_error:
+                self.error.emit(preflight_error)
+                return
+            server_args = [] if scope.uses_strategy else self._parse_preset_args(server_preset)
+            args = build_scoped_args(server_args, scope, args)
+            if not args:
+                if scope.uses_strategy:
+                    self.error.emit(f"Стратегия {scope.strategy or '?'} не подходит для сервера")
+                else:
+                    self.error.emit(f"В пресете {scope.preset} нет стратегий, которые можно применить к серверу")
+                return
+            if not preset_name:
+                preset = server_preset
+            title = scope.title
+            self.log_line.emit(
+                f"[zapret] {title[:1].upper() + title[1:]} применяется только к серверу {scope.describe()}"
+                + (f"; остальной трафик: {preset_name}" if preset_name else "")
+            )
 
         lists_error = self._ensure_compatibility_lists()
         missing_files = self._missing_referenced_files(args)
@@ -528,6 +575,7 @@ class ZapretManager(QObject):
             start_args = [f"@{at_config}"]
 
         self._current_preset = preset_name
+        self._server_scope = scope
         self._start_args = start_args
         self._start_retry_count = int(_retry_count)
         self._current_at_config = at_config
@@ -544,10 +592,10 @@ class ZapretManager(QObject):
 
         if at_config is not None:
             log.info("zapret start: %s [%s] via %s (%d args)", exe.name, preset_name, at_config.name, len(args))
-            self.log_line.emit(f"[zapret] Запуск: {preset_name} ({len(args)} аргументов через @{at_config.name})")
+            self.log_line.emit(f"[zapret] Запуск: {preset_name or (scope.title if scope else '')} ({len(args)} аргументов через @{at_config.name})")
         else:
             log.info("zapret start: %s [%s] via direct argv (%d args)", exe.name, preset_name, len(args))
-            self.log_line.emit(f"[zapret] Запуск: {preset_name} ({len(args)} аргументов напрямую)")
+            self.log_line.emit(f"[zapret] Запуск: {preset_name or (scope.title if scope else '')} ({len(args)} аргументов напрямую)")
         self._process.start()
 
         if not wait_for_qprocess_started(self._process, 1200):
@@ -562,8 +610,9 @@ class ZapretManager(QObject):
                 preset_name = self._current_preset
                 self.log_line.emit("[zapret] Прямой запуск не стартовал, пробую fallback через @config из ProgramData")
                 self._release_process()
-                QTimer.singleShot(150, lambda name=preset_name: self.start(
+                QTimer.singleShot(150, lambda name=preset_name, scope=self._server_scope: self.start(
                     name,
+                    server_scope=scope,
                     _retry_count=2,
                     _force_cleanup=False,
                     _launch_mode="at_config",
@@ -599,6 +648,7 @@ class ZapretManager(QObject):
 
         self._release_process(process)
         self._current_preset = ""
+        self._server_scope = None
         self._start_args = []
         self._start_retry_count = 0
         self._current_at_config = None
@@ -790,14 +840,15 @@ class ZapretManager(QObject):
             if (
                 launch_mode == "direct"
                 and self._start_retry_count == 0
-                and self._current_preset
+                and (self._current_preset or self._server_scope is not None)
                 and exit_code == 2
             ):
                 preset_name = self._current_preset
                 self.log_line.emit("[zapret] Ошибка аргументов, пробую fallback через @config из ProgramData")
                 self._release_process()
-                QTimer.singleShot(150, lambda name=preset_name: self.start(
+                QTimer.singleShot(150, lambda name=preset_name, scope=self._server_scope: self.start(
                     name,
+                    server_scope=scope,
                     _retry_count=2,
                     _force_cleanup=False,
                     _launch_mode="at_config",
@@ -806,14 +857,15 @@ class ZapretManager(QObject):
 
             if (
                 self._start_retry_count < 1
-                and self._current_preset
+                and (self._current_preset or self._server_scope is not None)
                 and self._looks_like_windivert_conflict(exit_code, output_for_diagnostics)
             ):
                 preset_name = self._current_preset
                 self.log_line.emit("[zapret] winws2 завершился с кодом 1, пробую повторный запуск после очистки WinDivert")
                 self._release_process()
-                QTimer.singleShot(150, lambda name=preset_name: self.start(
+                QTimer.singleShot(150, lambda name=preset_name, scope=self._server_scope: self.start(
                     name,
+                    server_scope=scope,
                     _retry_count=1,
                     _force_cleanup=True,
                     _launch_mode="direct",
@@ -823,14 +875,15 @@ class ZapretManager(QObject):
             if (
                 launch_mode == "direct"
                 and self._start_retry_count == 1
-                and self._current_preset
+                and (self._current_preset or self._server_scope is not None)
                 and exit_code in (1, 2)
             ):
                 preset_name = self._current_preset
                 self.log_line.emit("[zapret] Прямой запуск не прошёл, пробую fallback через @config из ProgramData")
                 self._release_process()
-                QTimer.singleShot(150, lambda name=preset_name: self.start(
+                QTimer.singleShot(150, lambda name=preset_name, scope=self._server_scope: self.start(
                     name,
+                    server_scope=scope,
                     _retry_count=2,
                     _force_cleanup=False,
                     _launch_mode="at_config",
@@ -858,6 +911,7 @@ class ZapretManager(QObject):
 
         self._release_process()
         self._current_preset = ""
+        self._server_scope = None
         self._start_args = []
         self._start_retry_count = 0
         self._current_at_config = None

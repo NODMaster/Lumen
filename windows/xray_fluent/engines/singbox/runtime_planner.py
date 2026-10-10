@@ -33,6 +33,7 @@ from ...constants import (
 )
 from ...models import Node, RoutingSettings
 from ...multiplex import apply_xray_multiplex
+from ...proxy_chain import CHAIN_FRONT_TAG, CHAIN_MAIN_TAG, ProxyChain, apply_xray_proxy_chain
 from ...routing_runtime import apply_singbox_gui_routing
 from ...xray_fragments import apply_xray_final_fragment
 from ...wireguard_normalization import normalize_singbox_wireguard_endpoints
@@ -213,7 +214,11 @@ def plan_singbox_runtime(
     tun_mode: bool = True,
     enable_hot_switch: bool = False,
     hot_switch_nodes: Iterable[Node] | None = None,
+    proxy_chain: ProxyChain | None = None,
 ) -> SingboxRuntimePlan:
+    if proxy_chain is not None and proxy_chain.active:
+        # The clash selector would bypass the chain hops; a restart is cheap.
+        enable_hot_switch = False
     if _node_is_full_singbox_config(node):
         runtime_config = deepcopy((node.outbound or {}).get("singbox_config") or {})
         _preserve_or_reject_semantic_fields(runtime_config)
@@ -364,6 +369,7 @@ def plan_singbox_runtime(
             preferred_protect_port=preferred_protect_port,
             preferred_protect_password=preferred_protect_password,
             clash_api_secret=clash_api_secret,
+            proxy_chain=proxy_chain,
         )
         if routing is not None:
             apply_singbox_gui_routing(plan.singbox_config, routing)
@@ -382,6 +388,12 @@ def plan_singbox_runtime(
         _replace_or_append_tagged(_ensure_list(runtime_config, "endpoints"), "proxy", native_proxy)
     else:
         outbounds[proxy_index] = native_proxy
+    chain_front = _apply_singbox_proxy_chain(
+        runtime_config,
+        proxy_chain,
+        multiplex_enabled=multiplex_enabled,
+        multiplex_concurrency=multiplex_concurrency,
+    )
     clash_api_selector = ""
     clash_api_node_signatures: tuple[tuple[str, str], ...] = ()
     if enable_hot_switch:
@@ -399,6 +411,12 @@ def plan_singbox_runtime(
         _ensure_endpoint_server_bootstrap_contract(runtime_config, native_proxy)
     else:
         _ensure_proxy_server_bootstrap_contract(runtime_config, native_proxy, node.server)
+    if chain_front is not None:
+        front_node, front_payload = chain_front
+        if _is_singbox_endpoint(front_payload):
+            _ensure_endpoint_server_bootstrap_contract(runtime_config, front_payload)
+        else:
+            _ensure_proxy_server_bootstrap_contract(runtime_config, front_payload, front_node.server)
     _apply_imported_proxy_dns(runtime_config, node, routing)
     _clamp_tun_mtu_for_proxy(runtime_config, native_proxy, enabled=tun_mode)
     _ensure_singbox_discord_proxy_contract(runtime_config, enabled=discord_proxy_enabled)
@@ -435,6 +453,7 @@ def _plan_hybrid_runtime(
     preferred_protect_port: int,
     preferred_protect_password: str,
     clash_api_secret: str,
+    proxy_chain: ProxyChain | None = None,
 ) -> SingboxRuntimePlan:
     relay_port = preferred_relay_port if preferred_relay_port > 0 else _find_free_port(preferred=SINGBOX_XRAY_RELAY_PORT)
     excluded_ports = {relay_port}
@@ -497,6 +516,7 @@ def _plan_hybrid_runtime(
             tail_fragment_enabled=tail_fragment_enabled,
             multiplex_enabled=multiplex_enabled,
             multiplex_concurrency=multiplex_concurrency,
+            proxy_chain=proxy_chain,
         ),
     )
     return SingboxRuntimePlan(
@@ -524,6 +544,115 @@ def _node_is_full_singbox_config(node: Node | None) -> bool:
         outbound.get("singbox_config"),
         dict,
     )
+
+
+def _find_singbox_dial_by_tag(payload: dict[str, Any], tag: str) -> tuple[str, int] | None:
+    for section in ("outbounds", "endpoints"):
+        items = payload.get(section)
+        if not isinstance(items, list):
+            continue
+        for index, item in enumerate(items):
+            if isinstance(item, dict) and str(item.get("tag") or "") == tag:
+                return section, index
+    return None
+
+
+def _build_singbox_chain_hop(
+    chain: ProxyChain,
+    node: Node,
+    role: str,
+    *,
+    tag: str,
+    multiplex_enabled: bool,
+    multiplex_concurrency: int,
+) -> dict[str, Any] | None:
+    label = str(getattr(node, "name", "") or getattr(node, "server", "") or "?")
+    if _node_should_use_xray_sidecar(node):
+        chain.notes.append(f"{role} прокси «{label}» требует ядро Xray и не может быть звеном sing-box — пропущено.")
+        return None
+    try:
+        payload = build_singbox_outbound(
+            node,
+            tag=tag,
+            multiplex_enabled=multiplex_enabled,
+            multiplex_concurrency=multiplex_concurrency,
+        )
+    except ValueError as exc:
+        chain.notes.append(f"{role} прокси «{label}» не поддерживается sing-box ({exc}) — пропущено.")
+        return None
+    payload["tag"] = tag
+    if _is_singbox_endpoint(payload):
+        _strip_legacy_awg15_fields(payload)
+    return payload
+
+
+def _insert_singbox_dial(payload: dict[str, Any], dial: dict[str, Any], *, index: int | None = None) -> None:
+    section = _ensure_list(payload, "endpoints" if _is_singbox_endpoint(dial) else "outbounds")
+    _replace_or_append_tagged(section, str(dial.get("tag") or ""), dial)
+    if index is not None and section and section[-1] is dial and 0 <= index < len(section) - 1:
+        section.insert(index, section.pop())
+
+
+def _apply_singbox_proxy_chain(
+    runtime_config: dict[str, Any],
+    chain: ProxyChain | None,
+    *,
+    multiplex_enabled: bool,
+    multiplex_concurrency: int,
+) -> tuple[Node, dict[str, Any]] | None:
+    """Wire the proxy chain into a native sing-box config via dial ``detour``.
+
+    Returns ``(front_node, front_payload)`` when a front hop was added: that hop
+    is the only one dialed directly and needs the server bootstrap contract.
+    """
+    if chain is None or not chain.active:
+        return None
+    location = _find_singbox_dial_by_tag(runtime_config, "proxy")
+    if location is None:
+        chain.notes.append("В конфиге нет outbound `proxy` — цепочка прокси не применена.")
+        return None
+    section, main_index = location
+    main = runtime_config[section][main_index]
+    hop_options = {"multiplex_enabled": multiplex_enabled, "multiplex_concurrency": multiplex_concurrency}
+    front = (
+        _build_singbox_chain_hop(chain, chain.front, "Предыдущий", tag=CHAIN_FRONT_TAG, **hop_options)
+        if chain.front is not None
+        else None
+    )
+    exit_ = (
+        _build_singbox_chain_hop(chain, chain.exit, "Выходной", tag="proxy", **hop_options)
+        if chain.exit is not None
+        else None
+    )
+
+    if front is not None:
+        inherited = str(main.get("detour") or "").strip()
+        if inherited:
+            front["detour"] = inherited
+        else:
+            front.pop("detour", None)
+        main["detour"] = CHAIN_FRONT_TAG
+        if _is_singbox_endpoint(front):
+            ensure_awg3_windows_bind_workaround(runtime_config, front)
+        _insert_singbox_dial(runtime_config, front)
+
+    if exit_ is not None:
+        main["tag"] = CHAIN_MAIN_TAG
+        exit_["detour"] = CHAIN_MAIN_TAG
+        _insert_singbox_dial(
+            runtime_config,
+            exit_,
+            index=main_index if section == "outbounds" and not _is_singbox_endpoint(exit_) else None,
+        )
+
+    # Hops after the first one are dialed through a detour; their domain names
+    # are still resolved locally and must not recurse into proxy-dns.
+    for dial in (main, exit_):
+        if isinstance(dial, dict) and dial is not front and _is_domain_name(str(dial.get("server") or "")):
+            dial["domain_resolver"] = "bootstrap-dns"
+    if front is None:
+        return None
+    return chain.front, front
 
 
 def singbox_node_tag(node_id: str) -> str:
@@ -760,6 +889,7 @@ def _build_xray_sidecar_config(
     tail_fragment_enabled: bool = False,
     multiplex_enabled: bool = False,
     multiplex_concurrency: int = 8,
+    proxy_chain: ProxyChain | None = None,
 ) -> dict[str, Any]:
     if not isinstance(node.outbound, dict) or not node.outbound:
         raise ValueError("Выбранный сервер не содержит outbound JSON для xray sidecar.")
@@ -891,6 +1021,9 @@ def _build_xray_sidecar_config(
             ],
         },
     }
+    # Proxy chain lives in the sidecar: the front hop inherits the protect
+    # dialer so it still leaves through sing-box `direct`.
+    apply_xray_proxy_chain(config["outbounds"], proxy_chain)
     if enable_final_fragment:
         apply_xray_final_fragment(
             config,
@@ -1570,6 +1703,10 @@ def _build_dns_server(tag: str, server: str, server_type: str, strategy: str) ->
         known_tls_name = _KNOWN_DOH_IP_HOSTS.get(address.lower())
         if known_tls_name:
             payload["tls"] = {"server_name": known_tls_name}
+            if not tag.startswith("proxy-dns"):
+                # Direct DoH by IP is visible to the ISP: no SNI in the
+                # ClientHello, the certificate is still checked for the name.
+                payload["tls"]["disable_sni"] = True
     elif dns_type == "tls":
         payload.setdefault("server_port", 853)
     elif dns_type in {"udp", "tcp"}:

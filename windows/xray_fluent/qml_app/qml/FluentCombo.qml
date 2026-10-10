@@ -111,10 +111,29 @@ ComboBox {
     }
 
     popup: Popup {
-        y: control.height + 4
+        id: comboPopup
+        // Opens upwards when the window has no room below the field.
+        property bool openUp: false
+        property real room: 100000
+        y: openUp ? -height - 4 : control.height + 4
         width: control.width
         padding: 4
-        implicitHeight: Math.min(contentItem.implicitHeight + topPadding + bottomPadding, 320)
+        implicitHeight: Math.min(contentItem.implicitHeight + topPadding + bottomPadding, 320,
+                                 Math.max(120, room))
+        onAboutToShow: {
+            var winH = control.Window.height
+            if (!(winH > 0)) {
+                openUp = false
+                room = 100000
+                return
+            }
+            var pos = control.mapToItem(null, 0, 0)
+            var below = winH - pos.y - control.height - 12
+            var above = pos.y - 12
+            var want = Math.min(320, control.count * 34 + topPadding + bottomPadding)
+            openUp = below < want && above > below
+            room = openUp ? above : below
+        }
 
         background: Rectangle {
             radius: 8
@@ -129,7 +148,7 @@ ComboBox {
             model: control.popup.visible ? control.delegateModel : null
             currentIndex: control.highlightedIndex
             boundsBehavior: Flickable.StopAtBounds
-            ScrollIndicator.vertical: ScrollIndicator {}
+            ScrollBar.vertical: FluentScrollBar {}
         }
 
         enter: Transition {

@@ -9,6 +9,7 @@ from xray_fluent.deeplinks import (
     decode_instance_message,
     encode_instance_message,
     find_lumen_deep_link,
+    parse_instance_message,
     parse_lumen_deep_link,
 )
 from xray_fluent.qml_app import main_qml
@@ -81,3 +82,35 @@ def test_source_run_registers_deep_links_through_run_qml(monkeypatch) -> None:
     command, _icon = launch
     assert "run_qml.py" in command
     assert command.endswith('" "%1"')
+
+
+def test_encode_instance_message_tray_and_activation() -> None:
+    # Tray launch should encode command="tray"
+    tray_payload = encode_instance_message(["Lumen.exe", "--tray"])
+    assert parse_instance_message(tray_payload) == ("tray", "")
+    assert decode_instance_message(tray_payload) == ""
+
+    # Normal launch should encode command="activate"
+    normal_payload = encode_instance_message(["Lumen.exe"])
+    assert parse_instance_message(normal_payload) == ("activate", "")
+    assert decode_instance_message(normal_payload) == ""
+
+    # Relaunches with --tray should still activate
+    relaunch_payload = encode_instance_message(["Lumen.exe", "--tray", "--relaunch-as-admin"])
+    assert parse_instance_message(relaunch_payload) == ("activate", "")
+
+    # Deep link takes priority over --tray
+    link = "lumen://add?url=https%3A%2F%2Fexample.com%2Fsub"
+    deeplink_tray_payload = encode_instance_message(["Lumen.exe", "--tray", link])
+    assert parse_instance_message(deeplink_tray_payload) == ("deeplink", link)
+    assert decode_instance_message(deeplink_tray_payload) == link
+
+
+def test_parse_instance_message_edge_cases() -> None:
+    assert parse_instance_message(b"") == ("activate", "")
+    assert parse_instance_message(b"activate") == ("activate", "")
+    assert parse_instance_message(b"invalid json") == ("activate", "")
+    assert parse_instance_message(b'{"command": "unknown"}') == ("activate", "")
+    assert parse_instance_message(b'{"command": "tray"}') == ("tray", "")
+    assert parse_instance_message(b'{"command": "activate"}') == ("activate", "")
+

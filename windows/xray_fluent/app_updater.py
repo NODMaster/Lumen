@@ -510,9 +510,10 @@ class UpdateChecker(QThread):
             default=None,
         )
         if not asset:
-            label = "zip-архив" if portable else "setup-установщик"
             self.error.emit(
-                f"Релиз {tag} найден, но отсутствует {label}"
+                f"Релиз {tag} найден, но отсутствует zip-архив"
+                if portable
+                else f"Релиз {tag} найден, но отсутствует setup-установщик"
             )
             return None
 
@@ -536,8 +537,11 @@ class UpdateChecker(QThread):
                     self._fetch_text(str(sidecar.get("browser_download_url") or ""))
                 )
         if not digest:
-            label = "zip-архив" if portable else "установщик"
-            self.error.emit(f"Релиз {tag} найден, но {label} не содержит SHA-256")
+            self.error.emit(
+                f"Релиз {tag} найден, но zip-архив не содержит SHA-256"
+                if portable
+                else f"Релиз {tag} найден, но установщик не содержит SHA-256"
+            )
             return None
 
         default_asset_name = "Lumen-portable-windows-x64.zip" if portable else "Lumen-Setup-windows-x64.exe"
@@ -876,17 +880,25 @@ class UpdateDownloader(QThread):
 
             self._raise_if_cancelled()
 
-            label = "архива" if is_portable() else "установщика"
-            self.status.emit(f"Проверка {label}...")
+            portable_package = is_portable()
+            self.status.emit("Проверка архива..." if portable_package else "Проверка установщика...")
             expected_hash = _extract_digest(self._update.digest_sha256)
             if not expected_hash:
-                self.error.emit(f"У релизного {label} отсутствует SHA-256")
+                self.error.emit(
+                    "У релизного архива отсутствует SHA-256"
+                    if portable_package
+                    else "У релизного установщика отсутствует SHA-256"
+                )
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 return
 
             real_hash = _sha256_file(setup_path)
             if real_hash.lower() != expected_hash.lower():
-                self.error.emit(f"Контрольная сумма {label} не совпадает")
+                self.error.emit(
+                    "Контрольная сумма архива не совпадает"
+                    if portable_package
+                    else "Контрольная сумма установщика не совпадает"
+                )
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 return
 

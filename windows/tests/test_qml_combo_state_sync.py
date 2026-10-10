@@ -147,12 +147,27 @@ def test_service_route_combo_shows_only_effective_direct_or_proxy() -> None:
     assert '"action": effective_service_action(routing, s.id)' in bridge_source
 
 
-def test_zapret_table_has_vertical_guides_for_the_first_three_boundaries() -> None:
+def test_zapret_page_exposes_server_bindings_and_autostart() -> None:
     zapret_qml = (QML_DIR / "ZapretPage.qml").read_text(encoding="utf-8")
 
-    assert "component ColumnGuide: Rectangle" in zapret_qml
-    assert "ColumnGuide { visible: headerCell.columnIndex < 3 }" in zapret_qml
-    assert zapret_qml.count("ColumnGuide {}") == 3
+    assert "App.zapretServerBindings()" in zapret_qml
+    assert "App.zapretServerOptions()" in zapret_qml
+    assert "App.setZapretServerBinding(" in zapret_qml
+    assert "App.removeZapretServerBinding(" in zapret_qml
+    assert "function onZapretBindingsChanged()" in zapret_qml
+    assert "SearchCombo {" in zapret_qml
+    # Autostart lives in Settings only; the page has no empty-bindings caption.
+    assert "zapretAutostart" not in zapret_qml
+    assert "App.setZapretAutostart(checked)" in (QML_DIR / "SettingsPage.qml").read_text(encoding="utf-8")
+    assert "Привязок нет" not in zapret_qml
+
+
+def test_zapret_preset_double_click_starts_it() -> None:
+    zapret_qml = (QML_DIR / "ZapretPage.qml").read_text(encoding="utf-8")
+
+    assert "onDoubleClicked: page.activatePreset(modelData.name)" in zapret_qml
+    assert "onDoubleClicked: page.openEditor" not in zapret_qml
+    assert "App.startZapret(name)" in zapret_qml
 
 
 def test_updates_page_hides_internal_lumen_singbox_revision() -> None:
@@ -170,13 +185,29 @@ def test_updates_page_does_not_expose_droute_updater() -> None:
     assert 'I18n.t("Проверить droute")' not in updates_qml
 
 
-def test_zapret_table_has_persisted_resizable_columns() -> None:
+def test_zapret_and_configs_pages_use_shared_code_editor() -> None:
     zapret_qml = (QML_DIR / "ZapretPage.qml").read_text(encoding="utf-8")
+    configs_qml = (QML_DIR / "ConfigsPage.qml").read_text(encoding="utf-8")
 
-    assert "App.zapretTableLayout" in zapret_qml
-    assert "App.setZapretTableLayout" in zapret_qml
-    assert "Qt.SplitHCursor" in zapret_qml
-    assert '"description": manualColDescription' in zapret_qml
+    assert (QML_DIR / "CodeEditor.qml").exists()
+    assert "CodeEditor {" in zapret_qml
+    assert "CodeEditor {" in configs_qml
+    assert "App.saveRenamedPreset(" in zapret_qml
+    assert "ColumnGuide" not in zapret_qml
+
+
+def test_settings_page_has_proxy_chain_card() -> None:
+    settings_qml = (QML_DIR / "SettingsPage.qml").read_text(encoding="utf-8")
+
+    assert "id: proxyChainCard" in settings_qml
+    assert "App.setProxyChainEnabled(" in settings_qml
+    assert "App.setProxyChainFront(" in settings_qml
+    assert "App.setProxyChainExit(" in settings_qml
+    assert "App.proxyChainPreview()" in settings_qml
+    # Servers for the chain are picked from a searchable list.
+    assert settings_qml.count("SearchCombo {") >= 2
+    assert (QML_DIR / "SearchCombo.qml").exists()
+    assert "SearchField {" in (QML_DIR / "SearchCombo.qml").read_text(encoding="utf-8")
 
 
 def test_zapret_table_column_layout_round_trips() -> None:
