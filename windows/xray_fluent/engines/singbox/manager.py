@@ -4,7 +4,6 @@ from collections import deque
 from copy import deepcopy
 from ipaddress import ip_network
 import json
-import base64
 import os
 import re
 import secrets
@@ -50,58 +49,15 @@ _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 # starts and receives a copy of the runtime config as $args[0]; it may rewrite
 # that file.  The edited config is checked by sing-box and then used for both
 # the core and Lumen's readiness probes (ports, TUN).  Any failure falls back to
-# the config Lumen generated.
+# the config Lumen generated.  The script runs with Lumen's own rights,
+# including administrator rights when Lumen is elevated.
 PRE_LAUNCH_SCRIPT_NAME = "pre_launch_singbox.ps1"
 CUSTOM_PRE_LAUNCH_SCRIPT = DATA_DIR / "custom" / PRE_LAUNCH_SCRIPT_NAME
-# Used when Lumen runs as administrator: Program Files is not writable by
-# ordinary programs, unlike the per-user data folder.
+# Also looked up next to Lumen.exe; the data folder copy wins.
 INSTALL_PRE_LAUNCH_SCRIPT = BASE_DIR / "custom" / PRE_LAUNCH_SCRIPT_NAME
 PRE_LAUNCH_CONFIG_FILE = RUNTIME_DIR / "singbox_config.pre_launch.json"
 PRE_LAUNCH_TIMEOUT_SEC = 30.0
-PRE_LAUNCH_ACL_TIMEOUT_SEC = 15.0
 _PRE_LAUNCH_LOG_LINES = 50
-
-# An elevated Lumen must not run code that a non-elevated program can change:
-# the script and every folder above it must be owned by Administrators, SYSTEM
-# or TrustedInstaller and must not give ordinary users write, delete or
-# permission rights (the file) or delete/permission rights (the folders).
-_PRE_LAUNCH_ACL_CHECK_PS = r"""
-$ErrorActionPreference = 'Stop'
-$target = '__TARGET__'
-$me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-$risky = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-4', 'S-1-5-32-547', $me)
-$trusted = @('S-1-5-32-544', 'S-1-5-18', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
-$path = (Get-Item -LiteralPath $target -Force).FullName
-$first = $true
-while ($path) {
-    $acl = Get-Acl -LiteralPath $path
-    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-    if ($trusted -notcontains $owner) { "unsafe owner $path"; exit 3 }
-    $mask = if ($first) { 0x500D0156 } else { 0x100D0040 }
-    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
-        if ($rule.AccessControlType -ne 'Allow') { continue }
-        if ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
-        if ($risky -notcontains $rule.IdentityReference.Value) { continue }
-        if (([int64]$rule.FileSystemRights) -band $mask) { "unsafe access $path"; exit 3 }
-    }
-    $parent = Split-Path -Parent $path
-    if (-not $parent -or $parent -eq $path) { break }
-    $path = $parent
-    $first = $false
-}
-'ok'
-"""
-
-
-def _process_elevated() -> bool:
-    try:
-        from ...startup import is_process_elevated
-
-        return bool(is_process_elevated())
-    except Exception:
-        # Unknown elevation is treated as elevated: the stricter check applies.
-        return True
-
 
 def _windows_system_dir() -> Path | None:
     try:
@@ -340,19 +296,6 @@ class SingBoxManager(QObject):
         if len(lines) > _PRE_LAUNCH_LOG_LINES:
             self.log_received.emit(f"{prefix} ... {len(lines) - _PRE_LAUNCH_LOG_LINES} more lines")
 
-    def _script_is_admin_only(self, script: Path, shell: Path) -> bool:
-        code = _PRE_LAUNCH_ACL_CHECK_PS.replace("__TARGET__", str(script).replace("'", "''"))
-        encoded = base64.b64encode(code.encode("utf-16-le")).decode("ascii")
-        try:
-            result = run_text_pumped(
-                [str(shell), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-                timeout=PRE_LAUNCH_ACL_TIMEOUT_SEC,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-        except Exception:
-            return False
-        return result.returncode == 0 and decode_output(result.stdout).strip().endswith("ok")
-
     def _apply_pre_launch_script(self, config: dict[str, Any]) -> dict[str, Any] | None:
         """Run the optional pre-launch script on a copy of ``config``.
 
@@ -368,17 +311,7 @@ class SingBoxManager(QObject):
         if shell is None:
             self.log_received.emit("[pre-launch] PowerShell not found; skipping script")
             return None
-        if _process_elevated():
-            script = next((path for path in present if self._script_is_admin_only(path, shell)), None)
-            if script is None:
-                self.log_received.emit(
-                    f"[pre-launch] Lumen runs as administrator, so {PRE_LAUNCH_SCRIPT_NAME} is skipped: "
-                    "programs without administrator rights can change it. "
-                    f"Put it in {INSTALL_PRE_LAUNCH_SCRIPT} (a folder only administrators can modify)"
-                )
-                return None
-        else:
-            script = present[0]
+        script = present[0]
 
         try:
             RUNTIME_DIR.mkdir(parents=True, exist_ok=True)

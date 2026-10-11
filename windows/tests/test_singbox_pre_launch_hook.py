@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import subprocess
 from copy import deepcopy
@@ -45,7 +44,6 @@ def hook(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "PRE_LAUNCH_CONFIG_FILE", runtime / "singbox_config.pre_launch.json")
     monkeypatch.setattr(m, "SINGBOX_CONFIG_FILE", runtime / "singbox_config.json")
     monkeypatch.setattr(m, "_powershell_executable", lambda: SHELL)
-    monkeypatch.setattr(m, "_process_elevated", lambda: False)
 
     def run(command, **kwargs):
         state.calls.append((list(command), kwargs))
@@ -88,32 +86,22 @@ def test_script_edits_a_copy_with_absolute_powershell(hook) -> None:
     assert "[pre-launch] готово" in hook.logs
 
 
-def test_elevated_lumen_skips_a_script_users_can_change(hook, monkeypatch) -> None:
-    monkeypatch.setattr(m, "_process_elevated", lambda: True)
-    _write_script(hook.user)
-    hook.runner = lambda command: _done(3, b"unsafe access")
-    assert hook.manager._apply_pre_launch_script(deepcopy(CONFIG)) is None
-    assert len(hook.calls) == 1 and "-EncodedCommand" in hook.calls[0][0]
-    assert not any("-File" in command for command, _ in hook.calls)
-    assert any("administrator" in line for line in hook.logs)
-
-
-def test_elevated_lumen_runs_an_admin_only_script(hook, monkeypatch) -> None:
-    monkeypatch.setattr(m, "_process_elevated", lambda: True)
+def test_script_next_to_lumen_is_used(hook) -> None:
     _write_script(hook.install)
-    checked: list[str] = []
-
-    def runner(command):
-        if "-EncodedCommand" in command:
-            code = base64.b64decode(command[-1]).decode("utf-16-le")
-            checked.append(code)
-            return _done(0, b"ok\r\n")
-        return _edit_port(2091)(command)
-
-    hook.runner = runner
+    hook.runner = _edit_port(2091)
     edited = hook.manager._apply_pre_launch_script(deepcopy(CONFIG))
     assert edited is not None and edited["inbounds"][0]["listen_port"] == 2091
-    assert checked and str(hook.install) in checked[0]
+    command = hook.calls[0][0]
+    assert command[command.index("-File") + 1] == str(hook.install)
+
+
+def test_data_folder_script_wins_over_the_one_next_to_lumen(hook) -> None:
+    _write_script(hook.user)
+    _write_script(hook.install)
+    hook.runner = _edit_port(2092)
+    assert hook.manager._apply_pre_launch_script(deepcopy(CONFIG)) is not None
+    command = hook.calls[0][0]
+    assert command[command.index("-File") + 1] == str(hook.user)
 
 
 def test_failed_script_keeps_the_original_config(hook) -> None:
