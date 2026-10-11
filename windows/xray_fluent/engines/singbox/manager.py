@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -18,6 +19,7 @@ from typing import Any
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from ...constants import (
+    DATA_DIR,
     PROXY_HOST,
     RUNTIME_DIR,
     SINGBOX_CLASH_API_PORT,
@@ -42,6 +44,10 @@ from ...subprocess_utils import (
 from .config_builder import _normalize_shadowsocks_methods
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+# Optional user hook: data/custom/pre_launch_singbox.ps1 runs right before
+# sing-box starts and receives the runtime config path as $args[0].
+CUSTOM_PRE_LAUNCH_SCRIPT = DATA_DIR / "custom" / "pre_launch_singbox.ps1"
 
 
 def _normalized_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -211,6 +217,46 @@ class SingBoxManager(QObject):
             if config_path is not None:
                 config_path.unlink(missing_ok=True)
 
+    def _run_pre_launch_script(self) -> None:
+        """Run data/custom/pre_launch_singbox.ps1 (if present) right before sing-box.
+
+        The script gets the runtime config path as $args[0] and may rewrite the
+        file in place. All output is logged; failures never block the core start.
+        """
+        script = CUSTOM_PRE_LAUNCH_SCRIPT
+        if not script.is_file():
+            return
+        shell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
+        if not shell:
+            self.log_received.emit("[pre-launch] PowerShell not found; skipping script")
+            return
+        self.log_received.emit(f"[pre-launch] running {script.name} via {Path(shell).name}")
+        try:
+            result = subprocess.run(
+                [
+                    shell, "-NoProfile", "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass",
+                    "-File", str(script), str(SINGBOX_CONFIG_FILE),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        except Exception as exc:
+            self.log_received.emit(f"[pre-launch] failed to run script: {exc}")
+            return
+        for line in (result.stdout or "").splitlines():
+            if line.strip():
+                self.log_received.emit(f"[pre-launch] {line}")
+        if result.returncode != 0:
+            for line in (result.stderr or "").splitlines():
+                if line.strip():
+                    self.log_received.emit(f"[pre-launch][err] {line}")
+            self.log_received.emit(
+                f"[pre-launch] script exited with code {result.returncode}; starting sing-box anyway"
+            )
+
     def start(
         self,
         singbox_path: str,
@@ -275,6 +321,7 @@ class SingBoxManager(QObject):
         SINGBOX_CONFIG_FILE.write_text(
             json.dumps(config, ensure_ascii=True, indent=2), encoding="utf-8"
         )
+        self._run_pre_launch_script()
         # Only a retained process handle proves ownership. Do not inspect/kill
         # other instances by executable name, or sweep unrelated Wintun devices.
 
